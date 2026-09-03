@@ -39,9 +39,12 @@ GPU acceleration matters only where measurement shows a real benefit without wea
 - Canonical sparse-model validation and a runnable contract check are implemented
 - A deterministic CPU execution backend and CPU correctness tests are implemented
 - An optional CUDA/cuSPARSE backend exists behind `VIKALP_ENABLE_CUDA`; hardware validation and profiling are pending
-- No optimization algorithm implementation yet
+- Flow C continuous baselines are implemented for bounded LP (restarted/preconditioned PDHG), convex QP (PDQP), and smooth NLP (primal-dual IPM)
+- Flow C analytic tests cover optimal solutions, row bounds, convexity rejection, warm starts, bound overrides, equality constraints, and residuals
 - No supported file format or stable end-user API yet
-- No GPU-performance or benchmark claims
+- CUDA uses the same `ExecutionBackend` solver contract, but GPU runtime and performance claims remain unverified
+
+Flow C deliberately remains a baseline: NLP requires a strictly feasible starting point, and its first KKT assembly uses a dense CSR pattern for small analytic cases. These are explicit limitations, not production-scale performance claims.
 
 ## Starting references
 
