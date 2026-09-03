@@ -35,11 +35,12 @@ GPU acceleration matters only where measurement shows a real benefit without wea
 
 ## Current status
 
-- Research and scope intake only
-- No solver implementation
-- No supported API or model format
+- Gate 0 public solver contracts are frozen under `include/vikalp/contracts`
+- Canonical sparse-model validation and a runnable contract check are implemented
+- No optimization algorithm implementation yet
+- No supported file format or stable end-user API yet
 - No GPU or benchmark claims
-- Architecture and dependency choices remain unapproved
+- Solver internals and external dependencies beyond C++20/CMake remain undecided
 
 ## Starting references
 
@@ -49,4 +50,3 @@ GPU acceleration matters only where measurement shows a real benefit without wea
 - [Netlib LP problems](https://www.netlib.org/lp/data/)
 - [MIPLIB 2017](https://miplib.zib.de/)
 - [QPLIB](https://qplib.zib.de/)
-
