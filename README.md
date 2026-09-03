@@ -2,62 +2,141 @@
 
 **Versatile Indigenous Kernel for Accelerated Large-scale Programming**
 
-*A sovereign GPU-accelerated mathematical optimization solver.*
+VIKALP is a C++20 mathematical optimization engine for linear, quadratic,
+nonlinear, and mixed-integer models. It provides a sparse in-memory model,
+an MPS reader, CPU execution, and an optional CUDA backend.
 
-VIKALP is an early-stage effort for Smart India Hackathon problem statement **SIH26119**, proposed by Mangalore Refinery and Petrochemicals Limited (MRPL). Its purpose is to build a transparent mathematical optimization **solver core** from first principles for large, sparse industrial problems.
+## Requirements
 
-## What VIKALP is
+- CMake 3.20 or newer
+- A C++20 compiler
+- Ninja or another CMake-supported build tool
+- Optional: NVIDIA CUDA Toolkit for GPU execution
 
-The initial target is a numerical engine for:
+## Build
 
-- Linear Programming (LP)
-- Mixed-Integer Linear Programming (MILP)
-- Convex Quadratic Programming (QP)
+Configure and build a release binary:
 
-The continuous and mixed-integer layers meet at the `RelaxationOracle`
-contract. The built-in `solve(model, options)` entry point connects the current
-LP/QP/NLP implementations to the MILP/MIQP/MINLP controllers; callers can still
-inject a custom oracle for tests and external experiments.
-
-## What VIKALP is not
-
-VIKALP is not a GUI, refinery dashboard, modeling-language clone, or wrapper around CPLEX, Gurobi, HiGHS, SCIP, CBC, cuOpt, or another solver. Existing solvers are references and external benchmarks; they must not become VIKALP's hidden numerical engine.
-
-## Engineering order
-
-```text
-Correctness
-  -> Numerical robustness
-  -> Reproducibility
-  -> Scalability
-  -> Performance
-  -> GPU acceleration
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ```
 
-GPU acceleration matters only where measurement shows a real benefit without weakening mathematical validity.
+To build with CUDA, provide the architecture supported by the target GPU. The
+default is `86`, suitable for the NVIDIA RTX 3050.
 
-## Current status
+```bash
+cmake -S . -B build-cuda -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DVIKALP_ENABLE_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build build-cuda
+```
 
-- Gate 0 public solver contracts are frozen under `include/vikalp/contracts`
-- Canonical sparse-model validation and a runnable contract check are implemented
-- A deterministic CPU execution backend and CPU correctness tests are implemented
-- An optional CUDA/cuSPARSE backend exists behind `VIKALP_ENABLE_CUDA`; hardware validation and profiling are pending
-- Flow C continuous baselines are implemented for bounded LP (restarted/preconditioned PDHG), convex QP (PDQP), and smooth NLP (primal-dual IPM)
-- Flow C analytic tests cover optimal solutions, row bounds, convexity rejection, warm starts, bound overrides, equality constraints, and residuals
-- Flow D branch-and-bound, convex outer approximation, refinery cases, and reproducible benchmark tooling are implemented
-- The built-in solver entry point has CPU integration coverage for LP, QP, NLP, MILP, MIQP, and MINLP
-- Flow D tests use a mock/feasible relaxation oracle; they are not performance or production-solver claims
-- `BackendPreference::Auto` currently selects the deterministic CPU backend; CUDA must be requested explicitly
-- The MPS reader and in-memory solver API are early-stage and not yet compatibility-stable
-- CUDA uses the same `ExecutionBackend` solver contract, but GPU runtime and performance claims remain unverified
+## Test
 
-Flow C deliberately remains a baseline: NLP requires a strictly feasible starting point, and its first KKT assembly uses a dense CSR pattern for small analytic cases. These are explicit limitations, not production-scale performance claims.
+Build and run the complete CPU test suite:
 
-## Starting references
+```bash
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
 
-- [Practical Large-Scale Linear Programming using Primal-Dual Hybrid Gradient](https://research.google/pubs/practical-large-scale-linear-programming-using-primal-dual-hybrid-gradient/)
-- [Parallelizing the dual revised simplex method](https://link.springer.com/article/10.1007/s12532-017-0130-5)
-- [cuPDLP-C](https://arxiv.org/abs/2312.14832)
-- [Netlib LP problems](https://www.netlib.org/lp/data/)
-- [MIPLIB 2017](https://miplib.zib.de/)
-- [QPLIB](https://qplib.zib.de/)
+For a CUDA build, run the same command against `build-cuda`. This includes the
+CPU/CUDA consistency test when CUDA support is enabled.
+
+```bash
+ctest --test-dir build-cuda --output-on-failure
+```
+
+## Use the engine
+
+Add VIKALP to a CMake project and link the solver target:
+
+```cmake
+add_subdirectory(path/to/vikalp)
+target_link_libraries(your_target PRIVATE vikalp_mip)
+```
+
+Construct a model and pass it to the public solver entry point. Models use a
+canonical minimization form with CSR constraint and quadratic matrices.
+
+```cpp
+#include <vikalp/solver/Solver.hpp>
+
+#include <iostream>
+
+int main() {
+    vikalp::Model model;
+    model.name = "bounded_lp";
+    model.linear_objective = {-1.0};
+    model.variable_lower = {0.0};
+    model.variable_upper = {10.0};
+    model.variable_types = {vikalp::VariableType::Continuous};
+    model.constraint_matrix.pattern = {0, 1, {0}, {}};
+
+    vikalp::SolverOptions options;
+    options.time_limit_seconds = 10.0;
+
+    const auto result = vikalp::solve(model, options);
+    if (result.status != vikalp::SolveStatus::Optimal) {
+        std::cerr << result.message << '\n';
+        return 1;
+    }
+
+    std::cout << "objective: " << result.objective_value << '\n';
+    std::cout << "x: " << result.primal_solution[0] << '\n';
+}
+```
+
+Select CUDA explicitly when using a CUDA-enabled build:
+
+```cpp
+vikalp::SolverOptions options;
+options.backend = vikalp::BackendPreference::CUDA;
+const auto result = vikalp::solve(model, options);
+```
+
+### Read an MPS model
+
+```cpp
+#include <vikalp/io/MpsReader.hpp>
+#include <vikalp/solver/Solver.hpp>
+
+#include <iostream>
+
+vikalp::MpsReader reader;
+vikalp::Model model;
+
+if (!reader.read("model.mps", model)) {
+    for (const auto& error : reader.errors()) {
+        std::cerr << error.line << ": " << error.message << '\n';
+    }
+    return 1;
+}
+
+const auto result = vikalp::solve(model);
+```
+
+## Run the benchmark
+
+The bundled benchmark runner executes deterministic refinery model cases and
+can write machine-readable results.
+
+```bash
+./build/vikalp_benchmark
+./build/vikalp_benchmark \
+  --csv benchmarks/results/latest.csv \
+  --json benchmarks/results/latest.json
+```
+
+Run `./build/vikalp_benchmark --help` for the available options.
+
+## Scope
+
+VIKALP is a solver core, not a graphical modeling environment. The current MPS
+reader and solver interfaces are under active development and should be
+evaluated against the requirements of each production workload.
