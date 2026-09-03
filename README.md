@@ -14,10 +14,10 @@ The initial target is a numerical engine for:
 - Mixed-Integer Linear Programming (MILP)
 - Convex Quadratic Programming (QP)
 
-The continuous and mixed-integer layers are developed independently. Flow D
-provides the mixed-integer controller and refinery smoke path through the
-`RelaxationOracle` contract; a production LP/QP/NLP relaxation oracle is still
-separate work.
+The continuous and mixed-integer layers meet at the `RelaxationOracle`
+contract. The built-in `solve(model, options)` entry point connects the current
+LP/QP/NLP implementations to the MILP/MIQP/MINLP controllers; callers can still
+inject a custom oracle for tests and external experiments.
 
 ## What VIKALP is not
 
@@ -45,8 +45,10 @@ GPU acceleration matters only where measurement shows a real benefit without wea
 - Flow C continuous baselines are implemented for bounded LP (restarted/preconditioned PDHG), convex QP (PDQP), and smooth NLP (primal-dual IPM)
 - Flow C analytic tests cover optimal solutions, row bounds, convexity rejection, warm starts, bound overrides, equality constraints, and residuals
 - Flow D branch-and-bound, convex outer approximation, refinery cases, and reproducible benchmark tooling are implemented
+- The built-in solver entry point has CPU integration coverage for LP, QP, NLP, MILP, MIQP, and MINLP
 - Flow D tests use a mock/feasible relaxation oracle; they are not performance or production-solver claims
-- No supported file format or stable end-user API yet
+- `BackendPreference::Auto` currently selects the deterministic CPU backend; CUDA must be requested explicitly
+- The MPS reader and in-memory solver API are early-stage and not yet compatibility-stable
 - CUDA uses the same `ExecutionBackend` solver contract, but GPU runtime and performance claims remain unverified
 
 Flow C deliberately remains a baseline: NLP requires a strictly feasible starting point, and its first KKT assembly uses a dense CSR pattern for small analytic cases. These are explicit limitations, not production-scale performance claims.

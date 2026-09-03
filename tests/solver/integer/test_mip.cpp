@@ -460,7 +460,7 @@ void test_binary_branching() {
 // 12. Integer branching (non-binary)
 void test_integer_branching() {
     auto model = make_1var_milp(1.0, -5.0, 5.0, vikalp::VariableType::Integer);
-    MockRelaxationOracle oracle([](auto &, auto lo, auto hi, auto, auto) {
+    MockRelaxationOracle oracle([](auto &, auto lo, auto, auto, auto) {
         vikalp::SolveResult r;
         r.status = vikalp::SolveStatus::Optimal;
         double val = lo[0]; // return lower bound as integer
@@ -563,7 +563,7 @@ void test_deterministic_order() {
 // 16. Mock oracle call count
 void test_mock_oracle_calls() {
     auto model = make_1var_milp(1.0, 0.0, 10.0);
-    MockRelaxationOracle oracle([](auto &, auto lo, auto hi, auto, auto) {
+    MockRelaxationOracle oracle([](auto &, auto, auto, auto, auto) {
         vikalp::SolveResult r;
         r.status = vikalp::SolveStatus::Optimal;
         r.objective_value = 5.0;

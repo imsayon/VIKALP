@@ -15,6 +15,11 @@
 
 namespace vikalp {
 
+/// Solve a model with VIKALP's built-in continuous relaxation solvers.
+[[nodiscard]] SolveResult solve(
+    const Model &model,
+    const SolverOptions &options = {});
+
 /// Solve a model by routing to the appropriate solver based on problem class.
 /// Continuous problems (LP/QP/NLP) → RelaxationOracle directly.
 /// Mixed-integer (MILP/MIQP) → Branch-and-bound.

@@ -1,7 +1,7 @@
 # Flow D — Mixed-Integer Engine Evidence
 
-Status: Flow D implementation complete. The PPT export remains deliberately
-pending.
+Status: Flow D implementation and CPU integration complete. The PPT export
+remains deliberately pending.
 
 ## Implemented scope
 
@@ -34,6 +34,9 @@ build/vikalp_benchmark --csv benchmarks/results/flow-d.csv \
 The MIP executable reports 33 focused checks. The benchmark uses a deliberately
 simple feasible `RelaxationOracle`, so its records are labelled `Feasible`; they
 are smoke evidence, not optimality or performance claims.
+
+The `integration` CTest target separately runs LP, QP, NLP, MILP, MIQP, and
+MINLP through the built-in solver entry point and real continuous solvers.
 
 ## External-oracle protocol
 
