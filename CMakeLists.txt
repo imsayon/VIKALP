@@ -8,6 +8,11 @@ add_library(vikalp_contracts src/contracts/Model.cpp)
 target_include_directories(vikalp_contracts PUBLIC include)
 target_compile_features(vikalp_contracts PUBLIC cxx_std_20)
 
+add_library(vikalp_io STATIC src/io/MpsReader.cpp)
+target_link_libraries(vikalp_io PUBLIC vikalp_contracts)
+target_include_directories(vikalp_io PUBLIC include)
+target_compile_features(vikalp_io PUBLIC cxx_std_20)
+
 # ── Flow B: CPU execution backend ─────────────────────────────────────────────
 add_library(vikalp_backend STATIC src/backend/cpu_ops.cpp)
 target_link_libraries(vikalp_backend PUBLIC vikalp_contracts)
@@ -50,6 +55,18 @@ if(BUILD_TESTING)
     add_executable(vikalp_model_validation_test tests/model/model_validation_test.cpp)
     target_link_libraries(vikalp_model_validation_test PRIVATE vikalp_contracts)
     add_test(NAME model_validation COMMAND vikalp_model_validation_test)
+
+    foreach(model_test IN ITEMS milp minlp miqp nlp qp)
+        add_executable(vikalp_${model_test}_model_test tests/model/${model_test}_model_test.cpp)
+        target_link_libraries(vikalp_${model_test}_model_test PRIVATE vikalp_contracts)
+        add_test(NAME ${model_test}_model COMMAND vikalp_${model_test}_model_test)
+    endforeach()
+
+    add_executable(vikalp_mps_reader_test tests/io/mps_reader_test.cpp)
+    target_link_libraries(vikalp_mps_reader_test PRIVATE vikalp_io)
+    add_test(NAME mps_reader COMMAND vikalp_mps_reader_test)
+    set_tests_properties(mps_reader PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 
     # Flow B backend correctness tests
     add_executable(vikalp_backend_test tests/test_backend.cpp)

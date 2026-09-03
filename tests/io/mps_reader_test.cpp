@@ -1,7 +1,8 @@
-#include "MpsReader.hpp"
+#include "vikalp/io/MpsReader.hpp"
 
 #include <cassert>
 #include <iostream>
+
 int main() {
     vikalp::MpsReader reader;
     vikalp::Model model;
@@ -10,12 +11,12 @@ int main() {
         reader.read("tests/io/simple_lp.mps", model);
 
     if (!success) {
-    for (const auto &error : reader.errors()) {
-        std::cerr << "Line " << error.line
-                  << ": " << error.message << '\n';
+        for (const auto &error : reader.errors()) {
+            std::cerr << "Line " << error.line
+                      << ": " << error.message << '\n';
+        }
+        return 1;
     }
-    return 1;
-}
 
     assert(model.name == "SIMPLELP");
 

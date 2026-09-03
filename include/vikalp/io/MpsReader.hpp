@@ -2,6 +2,7 @@
 
 #include "vikalp/contracts/Model.hpp"
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
