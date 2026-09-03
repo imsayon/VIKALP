@@ -24,6 +24,21 @@ RefineryConfig refinery_xl() {
     return RefineryConfig{20, 12, 12, 3, 3.0, false};
 }
 
+std::vector<RefineryDemoCase> refinery_demo_family() {
+    auto small_miqp = refinery_small();
+    small_miqp.include_quadratic = true;
+    auto medium_miqp = refinery_medium();
+    medium_miqp.include_quadratic = true;
+    return {
+        {"Refinery Small MILP", refinery_small()},
+        {"Refinery Medium MILP", refinery_medium()},
+        {"Refinery Large MILP", refinery_large()},
+        {"Refinery XL MILP", refinery_xl()},
+        {"Refinery Small MIQP", small_miqp},
+        {"Refinery Medium MIQP", medium_miqp},
+    };
+}
+
 Model build_refinery_model(const RefineryConfig &config) {
     Model model;
     model.name = "refinery_c" + std::to_string(config.num_crudes) +
@@ -33,6 +48,7 @@ Model build_refinery_model(const RefineryConfig &config) {
     const int C = std::max(1, config.num_crudes);
     const int U = std::max(1, config.num_units);
     const int P = std::max(1, config.num_products);
+    const int Q = std::max(0, config.num_quality);
 
     // Variable indexing:
     // 0 .. C-1: y_c (binary, crude selection)
@@ -103,9 +119,10 @@ Model build_refinery_model(const RefineryConfig &config) {
     // 1. Linking x_c <= 500 * y_c  -->  x_c - 500 * y_c <= 0  (C constraints)
     // 2. Crude mass balance: sum_p b_cp - x_c = 0             (C constraints)
     // 3. Product mass balance: sum_c b_cp - p_k = 0           (P constraints)
-    // 4. Processing capacity: sum_c x_c - sum_u Cap_u * z_u <= 0 (1 constraint)
+    // 4. Quality: sum_c quality_cq * b_cp - limit_q * p_k <= 0
+    // 5. Processing capacity: sum_c x_c - sum_u Cap_u * z_u <= 0 (1 constraint)
     //    where Cap_u = 300 + 100 * u
-    // 5. Unit activation limit: sum_u z_u >= 1                (1 constraint)
+    // 6. Unit activation limit: sum_u z_u >= 1                (1 constraint)
 
     struct RowDef {
         std::map<Index, Scalar> entries;
@@ -148,7 +165,23 @@ Model build_refinery_model(const RefineryConfig &config) {
         rows.push_back(std::move(row));
     }
 
-    // 4. Unit capacity: sum_c x_c - sum_u (300 + 100*u) * z_u <= 0
+    // 4. Product quality upper bounds. The coefficients are deterministic
+    // crude-quality surrogates; the rows keep the generated family feasible.
+    for (int p = 0; p < P; ++p) {
+        for (int q = 0; q < Q; ++q) {
+            RowDef row;
+            const Scalar limit = 1.8 + 0.03 * q;
+            row.entries[offset_pk + p] = -limit;
+            for (int c = 0; c < C; ++c) {
+                row.entries[offset_b + c * P + p] = 0.8 + 0.05 * c + 0.03 * q;
+            }
+            row.lower = -Model::infinity();
+            row.upper = 0.0;
+            rows.push_back(std::move(row));
+        }
+    }
+
+    // 5. Unit capacity: sum_c x_c - sum_u (300 + 100*u) * z_u <= 0
     {
         RowDef row;
         for (int c = 0; c < C; ++c) {
@@ -162,7 +195,7 @@ Model build_refinery_model(const RefineryConfig &config) {
         rows.push_back(std::move(row));
     }
 
-    // 5. At least one unit on: sum_u z_u >= 1
+    // 6. At least one unit on: sum_u z_u >= 1
     {
         RowDef row;
         for (int u = 0; u < U; ++u) {

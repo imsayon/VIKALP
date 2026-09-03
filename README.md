@@ -14,7 +14,10 @@ The initial target is a numerical engine for:
 - Mixed-Integer Linear Programming (MILP)
 - Convex Quadratic Programming (QP)
 
-These are goals, not current capabilities. The repository is presently in research and specification.
+The continuous and mixed-integer layers are developed independently. Flow D
+provides the mixed-integer controller and refinery smoke path through the
+`RelaxationOracle` contract; a production LP/QP/NLP relaxation oracle is still
+separate work.
 
 ## What VIKALP is not
 
@@ -37,9 +40,12 @@ GPU acceleration matters only where measurement shows a real benefit without wea
 
 - Gate 0 public solver contracts are frozen under `include/vikalp/contracts`
 - Canonical sparse-model validation and a runnable contract check are implemented
-- No optimization algorithm implementation yet
+- Flow D branch-and-bound, convex outer approximation, refinery cases, and
+  reproducible benchmark tooling are implemented
+- Flow D tests use a mock/feasible relaxation oracle; they are not performance or
+  production-solver claims
 - No supported file format or stable end-user API yet
-- No GPU or benchmark claims
+- No GPU or production benchmark claims
 - Solver internals and external dependencies beyond C++20/CMake remain undecided
 
 ## Starting references

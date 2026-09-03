@@ -1,238 +1,240 @@
-// Flow D — Branch-and-bound MIP engine implementation.
-//
-// Processing loop:
-//   1. Create root node
-//   2. While queue is non-empty and limits not reached:
-//      a. Pop best-bound node
-//      b. Solve relaxation via oracle
-//      c. Check infeasibility → prune
-//      d. Check bound pruning → prune
-//      e. Check integrality → candidate incumbent
-//      f. Try rounding heuristic
-//      g. Select branching variable (most-fractional)
-//      h. Create two children with tightened bounds
-//   3. Compute final gap and return SolveResult
+// Flow D — branch-and-bound MIP engine.
 
 #include "vikalp/solver/mip/BranchAndBound.hpp"
+
 #include "vikalp/solver/mip/BbNode.hpp"
 #include "vikalp/solver/mip/BbQueue.hpp"
+#include "vikalp/solver/mip/CutGenerator.hpp"
 #include "vikalp/solver/mip/Pseudocosts.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
-#include <limits>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace vikalp {
 namespace {
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Integrality helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Distance of x from the nearest integer.
-inline Scalar integrality_violation(Scalar x) {
-    return std::abs(x - std::round(x));
+Scalar integrality_violation(Scalar value) {
+    return std::abs(value - std::round(value));
 }
 
-/// True if all integer/binary variables in the solution are integral.
-bool is_integer_feasible(const Model &model,
-                         std::span<const Scalar> x,
-                         Scalar tol) {
+bool is_integer_feasible(const Model &model, std::span<const Scalar> x,
+                         Scalar tolerance) {
+    if (x.size() != static_cast<std::size_t>(model.num_variables())) return false;
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        if (model.variable_types[i] != VariableType::Continuous &&
+            integrality_violation(x[i]) > tolerance) {
+            return false;
+        }
+    }
+    return true;
+}
+
+Scalar max_integrality_residual(const Model &model, std::span<const Scalar> x) {
+    Scalar result = 0.0;
+    for (std::size_t i = 0; i < x.size() &&
+                            i < static_cast<std::size_t>(model.num_variables()); ++i) {
+        if (model.variable_types[i] != VariableType::Continuous) {
+            result = std::max(result, integrality_violation(x[i]));
+        }
+    }
+    return result;
+}
+
+Scalar evaluate_objective(const Model &model, std::span<const Scalar> x) {
+    Scalar result = model.objective_offset;
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        result += model.linear_objective[i] * x[i];
+    }
+    const auto &q = model.quadratic_objective;
+    for (Index row = 0; row < q.pattern.rows; ++row) {
+        for (Index position = q.pattern.row_offsets[static_cast<std::size_t>(row)];
+             position < q.pattern.row_offsets[static_cast<std::size_t>(row + 1)];
+             ++position) {
+            const auto pos = static_cast<std::size_t>(position);
+            result += 0.5 * q.values[pos] * x[static_cast<std::size_t>(row)] *
+                      x[static_cast<std::size_t>(q.pattern.column_indices[pos])];
+        }
+    }
+    return result;
+}
+
+bool is_feasible(const Model &model, std::span<const Scalar> x, Scalar tolerance,
+                 const std::vector<Scalar> *lower_override = nullptr,
+                 const std::vector<Scalar> *upper_override = nullptr) {
     const auto n = static_cast<std::size_t>(model.num_variables());
     if (x.size() != n) return false;
+    const auto &lower = lower_override ? *lower_override : model.variable_lower;
+    const auto &upper = upper_override ? *upper_override : model.variable_upper;
     for (std::size_t i = 0; i < n; ++i) {
-        if (model.variable_types[i] == VariableType::Continuous) continue;
-        if (integrality_violation(x[i]) > tol) return false;
+        if (!std::isfinite(x[i]) || x[i] < lower[i] - tolerance ||
+            x[i] > upper[i] + tolerance) {
+            return false;
+        }
+    }
+
+    const auto &matrix = model.constraint_matrix;
+    for (std::size_t row = 0;
+         row < static_cast<std::size_t>(model.num_constraints()); ++row) {
+        Scalar activity = 0.0;
+        for (Index position = matrix.pattern.row_offsets[row];
+             position < matrix.pattern.row_offsets[row + 1]; ++position) {
+            const auto pos = static_cast<std::size_t>(position);
+            activity += matrix.values[pos] *
+                        x[static_cast<std::size_t>(matrix.pattern.column_indices[pos])];
+        }
+        if (activity < model.constraint_lower[row] - tolerance ||
+            activity > model.constraint_upper[row] + tolerance) {
+            return false;
+        }
     }
     return true;
 }
 
-/// Maximum integrality violation across integer/binary variables.
-Scalar max_integrality_residual(const Model &model,
-                                std::span<const Scalar> x) {
-    Scalar worst = 0.0;
-    const auto n = static_cast<std::size_t>(model.num_variables());
-    for (std::size_t i = 0; i < n && i < x.size(); ++i) {
-        if (model.variable_types[i] == VariableType::Continuous) continue;
-        worst = std::max(worst, integrality_violation(x[i]));
-    }
-    return worst;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Branching
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Select the most-fractional integer variable.
-/// Returns -1 if no fractional integer variable exists.
-Index select_most_fractional(const Model &model,
-                             std::span<const Scalar> x,
-                             const std::vector<Scalar> &eff_lo,
-                             const std::vector<Scalar> &eff_hi,
-                             Scalar int_tol) {
-    Index best = -1;
-    Scalar best_frac = -1.0;
-
-    const auto n = static_cast<std::size_t>(model.num_variables());
-    for (std::size_t i = 0; i < n && i < x.size(); ++i) {
-        if (model.variable_types[i] == VariableType::Continuous) continue;
-
-        const Scalar val = x[i];
-        const Scalar viol = integrality_violation(val);
-        if (viol <= int_tol) continue;
-
-        const Scalar floor_val = std::floor(val);
-        const Scalar ceil_val = std::ceil(val);
-        if (floor_val < eff_lo[i] && ceil_val > eff_hi[i]) continue;
-
-        const Scalar frac_part = val - floor_val;
-        const Scalar closeness_to_half = 0.5 - std::abs(frac_part - 0.5);
-
-        if (closeness_to_half > best_frac ||
-            (closeness_to_half == best_frac && static_cast<Index>(i) < best)) {
-            best_frac = closeness_to_half;
-            best = static_cast<Index>(i);
+Index select_most_fractional(const Model &model, std::span<const Scalar> x,
+                             const std::vector<Scalar> &lower,
+                             const std::vector<Scalar> &upper, Scalar tolerance) {
+    Index selected = -1;
+    Scalar best = -1.0;
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        if (model.variable_types[i] == VariableType::Continuous ||
+            integrality_violation(x[i]) <= tolerance) {
+            continue;
+        }
+        const Scalar floor_value = std::floor(x[i]);
+        const Scalar ceil_value = std::ceil(x[i]);
+        if (floor_value < lower[i] && ceil_value > upper[i]) continue;
+        const Scalar score = 0.5 - std::abs((x[i] - floor_value) - 0.5);
+        if (score > best || (score == best && static_cast<Index>(i) < selected)) {
+            selected = static_cast<Index>(i);
+            best = score;
         }
     }
-    return best;
+    return selected;
 }
 
-/// Select branching variable using pseudocost scores.
-/// Falls back to most-fractional if no variable has reliable pseudocosts.
-Index select_pseudocost(const Model &model,
-                        std::span<const Scalar> x,
-                        const std::vector<Scalar> &eff_lo,
-                        const std::vector<Scalar> &eff_hi,
-                        Scalar int_tol,
-                        const PseudocostTracker &psc) {
-    Index best = -1;
-    Scalar best_score = -1.0;
-
-    const auto n = static_cast<std::size_t>(model.num_variables());
-    for (std::size_t i = 0; i < n && i < x.size(); ++i) {
-        if (model.variable_types[i] == VariableType::Continuous) continue;
-
-        const Scalar val = x[i];
-        const Scalar viol = integrality_violation(val);
-        if (viol <= int_tol) continue;
-
-        const Scalar floor_val = std::floor(val);
-        const Scalar ceil_val = std::ceil(val);
-        if (floor_val < eff_lo[i] && ceil_val > eff_hi[i]) continue;
-
-        const Scalar frac_down = val - floor_val;
-        const Scalar frac_up = ceil_val - val;
-        const Scalar sc = psc.score(static_cast<Index>(i), frac_down, frac_up);
-
-        if (sc > best_score ||
-            (sc == best_score && static_cast<Index>(i) < best)) {
-            best_score = sc;
-            best = static_cast<Index>(i);
+Index select_pseudocost(const Model &model, std::span<const Scalar> x,
+                        const std::vector<Scalar> &lower,
+                        const std::vector<Scalar> &upper, Scalar tolerance,
+                        const PseudocostTracker &pseudocosts) {
+    Index selected = -1;
+    Scalar best = -1.0;
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        if (model.variable_types[i] == VariableType::Continuous ||
+            integrality_violation(x[i]) <= tolerance ||
+            !pseudocosts.is_reliable(static_cast<Index>(i))) {
+            continue;
+        }
+        const Scalar floor_value = std::floor(x[i]);
+        const Scalar ceil_value = std::ceil(x[i]);
+        if (floor_value < lower[i] && ceil_value > upper[i]) continue;
+        const Scalar score = pseudocosts.score(
+            static_cast<Index>(i), x[i] - floor_value, ceil_value - x[i]);
+        if (score > best || (score == best && static_cast<Index>(i) < selected)) {
+            selected = static_cast<Index>(i);
+            best = score;
         }
     }
-    return best;
+    return selected >= 0 ? selected :
+        select_most_fractional(model, x, lower, upper, tolerance);
 }
 
-constexpr int PSEUDOCOST_WARMUP_NODES = 8;  // use most-fractional for first N nodes
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Rounding heuristic
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Try to round a relaxation solution to integer feasibility.
-/// Returns true if rounding produced a valid candidate; fills rounded_obj.
-bool try_rounding(const Model &model,
-                  std::span<const Scalar> x,
-                  const std::vector<Scalar> &eff_lo,
-                  const std::vector<Scalar> &eff_hi,
-                  std::vector<Scalar> &rounded,
-                  Scalar &rounded_obj,
-                  Scalar int_tol,
-                  Scalar primal_tol) {
+bool try_rounding(const Model &model, std::span<const Scalar> x,
+                  const std::vector<Scalar> &lower, const std::vector<Scalar> &upper,
+                  std::vector<Scalar> &rounded, Scalar &objective,
+                  Scalar int_tolerance, Scalar primal_tolerance) {
     const auto n = static_cast<std::size_t>(model.num_variables());
-    rounded.resize(n);
-
-    // 1. Copy and round integer variables
+    if (x.size() != n) return false;
+    rounded.assign(x.begin(), x.end());
     for (std::size_t i = 0; i < n; ++i) {
-        Scalar val = x[i];
         if (model.variable_types[i] != VariableType::Continuous) {
-            val = std::round(val);
+            rounded[i] = std::round(rounded[i]);
         }
-        // 2. Clamp to effective bounds
-        val = std::max(val, eff_lo[i]);
-        val = std::min(val, eff_hi[i]);
-        rounded[i] = val;
+        rounded[i] = std::clamp(rounded[i], lower[i], upper[i]);
     }
-
-    // 3. Verify integrality
-    if (!is_integer_feasible(model, std::span<const Scalar>(rounded), int_tol))
+    if (!is_integer_feasible(model, rounded, int_tolerance) ||
+        !is_feasible(model, rounded, primal_tolerance, &lower, &upper)) {
         return false;
-
-    // 4. Verify constraint feasibility: Ax must be within [constraint_lower, constraint_upper]
-    const auto &A = model.constraint_matrix;
-    const auto m = static_cast<std::size_t>(model.num_constraints());
-    for (std::size_t row = 0; row < m; ++row) {
-        Scalar ax = 0.0;
-        for (Index k = A.pattern.row_offsets[row];
-             k < A.pattern.row_offsets[row + 1]; ++k) {
-            const auto col = static_cast<std::size_t>(
-                A.pattern.column_indices[static_cast<std::size_t>(k)]);
-            ax += A.values[static_cast<std::size_t>(k)] * rounded[col];
-        }
-        if (ax < model.constraint_lower[row] - primal_tol ||
-            ax > model.constraint_upper[row] + primal_tol) {
-            return false;  // violated
-        }
     }
-
-    // 5. Compute objective: c'x + offset (ignore quadratic for simplicity)
-    rounded_obj = model.objective_offset;
-    for (std::size_t i = 0; i < n; ++i) {
-        rounded_obj += model.linear_objective[i] * rounded[i];
-    }
-
-    return true;
+    objective = evaluate_objective(model, rounded);
+    return std::isfinite(objective);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Gap computation
-// ─────────────────────────────────────────────────────────────────────────────
-
-Scalar compute_absolute_gap(Scalar primal, Scalar dual) {
-    if (!std::isfinite(primal) || !std::isfinite(dual))
-        return Model::infinity();
+Scalar absolute_gap(Scalar primal, Scalar dual) {
+    if (!std::isfinite(primal) || !std::isfinite(dual)) return Model::infinity();
     return std::max(0.0, primal - dual);
 }
 
-Scalar compute_relative_gap(Scalar primal, Scalar dual) {
-    const Scalar ag = compute_absolute_gap(primal, dual);
-    if (!std::isfinite(ag)) return Model::infinity();
-    return ag / std::max(1.0, std::abs(primal));
+Scalar relative_gap(Scalar primal, Scalar dual) {
+    const Scalar absolute = absolute_gap(primal, dual);
+    return std::isfinite(absolute) ? absolute / std::max(1.0, std::abs(primal))
+                                   : Model::infinity();
 }
 
-} // namespace
+bool valid_cut(const Model &model, const Cut &cut) {
+    if (cut.indices.empty() || cut.indices.size() != cut.coefficients.size() ||
+        std::isnan(cut.lower) || std::isnan(cut.upper) || cut.lower > cut.upper) {
+        return false;
+    }
+    Index previous = -1;
+    for (std::size_t i = 0; i < cut.indices.size(); ++i) {
+        if (cut.indices[i] <= previous ||
+            cut.indices[i] < 0 || cut.indices[i] >= model.num_variables() ||
+            !std::isfinite(cut.coefficients[i])) {
+            return false;
+        }
+        previous = cut.indices[i];
+    }
+    return std::isfinite(cut.lower) || std::isfinite(cut.upper);
+}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Main solver
-// ─────────────────────────────────────────────────────────────────────────────
+bool append_cuts(Model &model, const std::vector<Cut> &cuts) {
+    for (const auto &cut : cuts) {
+        if (!valid_cut(model, cut)) return false;
+    }
+    for (const auto &cut : cuts) {
+        model.constraint_lower.push_back(cut.lower);
+        model.constraint_upper.push_back(cut.upper);
+        for (std::size_t i = 0; i < cut.indices.size(); ++i) {
+            model.constraint_matrix.pattern.column_indices.push_back(cut.indices[i]);
+            model.constraint_matrix.values.push_back(cut.coefficients[i]);
+        }
+        model.constraint_matrix.pattern.row_offsets.push_back(
+            static_cast<Index>(model.constraint_matrix.pattern.column_indices.size()));
+    }
+    model.constraint_matrix.pattern.rows += static_cast<Index>(cuts.size());
+    return true;
+}
 
-SolveResult solve_mip(const Model &model,
-                      const RelaxationOracle &oracle,
-                      const SolverOptions &options) {
+bool usable_relaxation(const SolveResult &relaxation, std::size_t variables) {
+    if (relaxation.primal_solution.size() != variables ||
+        !std::isfinite(relaxation.objective_value)) {
+        return false;
+    }
+    return std::all_of(relaxation.primal_solution.begin(),
+                       relaxation.primal_solution.end(),
+                       [](Scalar value) { return std::isfinite(value); });
+}
+
+SolveResult solve_mip_impl(const Model &model, const RelaxationOracle &oracle,
+                           const SolverOptions &options,
+                           const CutGenerator *root_cut_generator) {
     SolveResult result;
     result.solver = "vikalp-mip-bnb";
 
-    // ── Validate ─────────────────────────────────────────────────────────────
+    if (model.nonlinear) {
+        result.status = SolveStatus::UnsupportedModel;
+        result.message = "MIP branch-and-bound requires a linear or quadratic model";
+        return result;
+    }
     if (!model.has_integer_variables()) {
         result.status = SolveStatus::UnsupportedModel;
         result.message = "Model has no integer variables; use a continuous solver";
         return result;
     }
-
     const auto errors = model.validate();
     if (!errors.empty()) {
         result.status = SolveStatus::InvalidModel;
@@ -240,277 +242,274 @@ SolveResult solve_mip(const Model &model,
         return result;
     }
 
-    // ── Setup ────────────────────────────────────────────────────────────────
-    const auto start_time = std::chrono::steady_clock::now();
-    const Scalar int_tol = options.integrality_tolerance;
-    const Scalar abs_gap_tol = options.absolute_gap_tolerance;
-    const Scalar rel_gap_tol = options.relative_gap_tolerance;
-
-    Scalar incumbent_obj = Model::infinity();
-    std::vector<Scalar> incumbent_solution;
-    Scalar global_dual_bound = -Model::infinity();
-
+    const auto start = std::chrono::steady_clock::now();
+    const Scalar int_tolerance = options.integrality_tolerance;
+    Model working_model = model;
     BbQueue queue;
     PseudocostTracker pseudocosts(model.num_variables());
+    Scalar incumbent_objective = Model::infinity();
+    std::vector<Scalar> incumbent_solution;
+    bool root_cuts_applied = root_cut_generator == nullptr;
+    bool all_bounds_certified = true;
+    SolveStatus termination = SolveStatus::NotSolved;
 
-    // ── Root node ────────────────────────────────────────────────────────────
     BbNode root;
     root.id = queue.next_id();
-    root.parent_id = -1;
-    root.depth = 0;
-    root.status = NodeStatus::Open;
     queue.push(std::move(root));
 
-    // ── Main loop ────────────────────────────────────────────────────────────
-    SolveStatus termination = SolveStatus::Optimal;
-
     while (!queue.empty()) {
-        // Time check
-        auto elapsed = std::chrono::steady_clock::now() - start_time;
-        double elapsed_sec = std::chrono::duration<double>(elapsed).count();
-        if (elapsed_sec >= options.time_limit_seconds) {
+        const auto elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        if (elapsed >= options.time_limit_seconds) {
             termination = SolveStatus::TimeLimit;
             break;
         }
-
-        // Node limit check
         if (queue.nodes_processed >= options.node_limit) {
             termination = SolveStatus::NodeLimit;
             break;
         }
 
-        // Pop best-bound node
         BbNode node = queue.pop();
-        queue.nodes_processed++;
-
-        // Build effective bounds
-        auto eff_lo = effective_lower_bounds(model, node);
-        auto eff_hi = effective_upper_bounds(model, node);
-
-        // Check for infeasible bounds (lo > hi)
+        ++queue.nodes_processed;
+        const auto lower = effective_lower_bounds(working_model, node);
+        const auto upper = effective_upper_bounds(working_model, node);
         bool bounds_infeasible = false;
-        for (std::size_t i = 0; i < eff_lo.size(); ++i) {
-            if (eff_lo[i] > eff_hi[i] + options.primal_tolerance) {
+        for (std::size_t i = 0; i < lower.size(); ++i) {
+            if (lower[i] > upper[i] + options.primal_tolerance) {
                 bounds_infeasible = true;
                 break;
             }
         }
         if (bounds_infeasible) {
-            node.status = NodeStatus::Infeasible;
-            queue.nodes_infeasible++;
+            ++queue.nodes_infeasible;
             continue;
         }
 
-        // ── Solve relaxation ─────────────────────────────────────────────────
-        SolveResult rel = oracle.solve(
-            model,
-            std::span<const Scalar>(eff_lo),
-            std::span<const Scalar>(eff_hi),
-            std::span<const Scalar>(node.relaxation_solution),  // warm start
-            options);
+        const Scalar parent_bound = node.relaxation_bound;
+        const bool has_parent_solution = node.parent_id >= 0 &&
+                                          node.relaxation_solution.size() == lower.size();
+        const Scalar parent_branch_value =
+            has_parent_solution && node.branching_variable >= 0
+                ? node.relaxation_solution[static_cast<std::size_t>(node.branching_variable)]
+                : 0.0;
 
-        // ── Infeasibility pruning ────────────────────────────────────────────
-        if (rel.status == SolveStatus::Infeasible ||
-            rel.status == SolveStatus::InvalidModel) {
-            node.status = NodeStatus::Infeasible;
-            queue.nodes_infeasible++;
+        SolveResult relaxation = oracle.solve(
+            working_model, lower, upper, node.relaxation_solution, options);
+        if (relaxation.status == SolveStatus::Infeasible) {
+            ++queue.nodes_infeasible;
             continue;
         }
-
-        // ── Numerical failure → skip ─────────────────────────────────────────
-        if (rel.status == SolveStatus::NumericalFailure ||
-            rel.status == SolveStatus::NotSolved) {
-            node.status = NodeStatus::Pruned;
-            queue.nodes_pruned++;
-            continue;
+        if (relaxation.status == SolveStatus::Unbounded ||
+            relaxation.status == SolveStatus::UnsupportedModel ||
+            relaxation.status == SolveStatus::InvalidModel ||
+            relaxation.status == SolveStatus::NumericalFailure ||
+            relaxation.status == SolveStatus::NotSolved) {
+            termination = relaxation.status;
+            result.message = "Relaxation oracle failed at node " + std::to_string(node.id);
+            break;
+        }
+        if (relaxation.status != SolveStatus::Optimal &&
+            relaxation.status != SolveStatus::LocallyOptimal &&
+            relaxation.status != SolveStatus::Feasible) {
+            termination = relaxation.status;
+            result.message = "Relaxation oracle did not produce a solved relaxation";
+            break;
+        }
+        if (!usable_relaxation(relaxation, lower.size()) ||
+            !is_feasible(working_model, relaxation.primal_solution,
+                         options.primal_tolerance, &lower, &upper)) {
+            termination = SolveStatus::NumericalFailure;
+            result.message = "Relaxation oracle returned an invalid primal solution";
+            break;
         }
 
-        // Use the relaxation objective as the node bound
-        node.relaxation_bound = rel.objective_value;
-        node.relaxation_solution = rel.primal_solution;
-
-        // ── Bound pruning ────────────────────────────────────────────────────
-        if (node.relaxation_bound >= incumbent_obj - abs_gap_tol) {
-            node.status = NodeStatus::Pruned;
-            queue.nodes_pruned++;
-            continue;
-        }
-
-        // ── Integrality check ────────────────────────────────────────────────
-        if (is_integer_feasible(model,
-                                std::span<const Scalar>(rel.primal_solution),
-                                int_tol)) {
-            node.status = NodeStatus::Integral;
-            queue.nodes_integral++;
-            if (rel.objective_value < incumbent_obj) {
-                incumbent_obj = rel.objective_value;
-                incumbent_solution = rel.primal_solution;
-                queue.incumbent_updates++;
-            }
-
-            // Check gap termination after incumbent update
-            global_dual_bound = queue.empty() ?
-                incumbent_obj : std::max(global_dual_bound, queue.best_bound());
-            const Scalar ag = compute_absolute_gap(incumbent_obj, global_dual_bound);
-            const Scalar rg = compute_relative_gap(incumbent_obj, global_dual_bound);
-            if (ag <= abs_gap_tol || rg <= rel_gap_tol)
+        if (!root_cuts_applied && node.parent_id < 0) {
+            root_cuts_applied = true;
+            const auto cuts = root_cut_generator->generate(
+                working_model, relaxation.primal_solution);
+            if (!append_cuts(working_model, cuts)) {
+                termination = SolveStatus::InvalidModel;
+                result.message = "Root cut generator returned an invalid cut";
                 break;
+            }
+            if (!cuts.empty()) {
+                relaxation = oracle.solve(working_model, lower, upper,
+                                          node.relaxation_solution, options);
+                if (relaxation.status != SolveStatus::Optimal &&
+                    relaxation.status != SolveStatus::LocallyOptimal &&
+                    relaxation.status != SolveStatus::Feasible) {
+                    termination = relaxation.status;
+                    result.message = "Relaxation oracle failed after root cuts";
+                    break;
+                }
+                if (!usable_relaxation(relaxation, lower.size()) ||
+                    !is_feasible(working_model, relaxation.primal_solution,
+                                 options.primal_tolerance, &lower, &upper)) {
+                    termination = SolveStatus::NumericalFailure;
+                    result.message = "Relaxation oracle returned an invalid cut relaxation";
+                    break;
+                }
+            }
+        }
 
+        const bool bound_certified = relaxation.status == SolveStatus::Optimal ||
+                                     std::isfinite(relaxation.dual_bound);
+        all_bounds_certified = all_bounds_certified && bound_certified;
+        const Scalar node_bound = std::isfinite(relaxation.dual_bound)
+            ? relaxation.dual_bound
+            : (relaxation.status == SolveStatus::Optimal
+                   ? relaxation.objective_value : -Model::infinity());
+        if (has_parent_solution && std::isfinite(parent_bound) &&
+            node.branching_variable >= 0) {
+            const Scalar delta = std::max(0.0, node_bound - parent_bound);
+            const Scalar distance = node.branch_direction == BranchDirection::Down
+                ? parent_branch_value - std::floor(parent_branch_value)
+                : std::ceil(parent_branch_value) - parent_branch_value;
+            if (node.branch_direction == BranchDirection::Down) {
+                pseudocosts.record_down(node.branching_variable, delta, distance);
+            } else {
+                pseudocosts.record_up(node.branching_variable, delta, distance);
+            }
+        }
+
+        if (std::isfinite(incumbent_objective) && std::isfinite(node_bound) &&
+            node_bound >= incumbent_objective - options.absolute_gap_tolerance) {
+            ++queue.nodes_pruned;
             continue;
         }
 
-        // ── Rounding heuristic ───────────────────────────────────────────────
-        {
-            std::vector<Scalar> rounded;
-            Scalar rounded_obj = 0.0;
-            if (try_rounding(model, std::span<const Scalar>(rel.primal_solution),
-                             eff_lo, eff_hi, rounded, rounded_obj,
-                             int_tol, options.primal_tolerance)) {
-                if (rounded_obj < incumbent_obj) {
-                    incumbent_obj = rounded_obj;
-                    incumbent_solution = std::move(rounded);
-                    queue.incumbent_updates++;
-                }
+        const auto update_incumbent = [&](Scalar objective, std::vector<Scalar> solution) {
+            if (std::isfinite(objective) && objective < incumbent_objective) {
+                incumbent_objective = objective;
+                incumbent_solution = std::move(solution);
+                ++queue.incumbent_updates;
             }
-        }
+        };
 
-        // ── Record pseudocost observation from parent branching ───────────
-        if (node.branching_variable >= 0 && node.parent_id >= 0) {
-            const Scalar parent_bound = node.relaxation_bound;
-            const Scalar delta = std::max(0.0, rel.objective_value - parent_bound);
-            const auto bv = static_cast<std::size_t>(node.branching_variable);
-            if (bv < node.relaxation_solution.size()) {
-                const Scalar parent_val = node.relaxation_solution[bv];
-                if (node.branch_direction == BranchDirection::Down) {
-                    const Scalar frac = parent_val - std::floor(parent_val);
-                    pseudocosts.record_down(node.branching_variable, delta, frac);
-                } else {
-                    const Scalar frac = std::ceil(parent_val) - parent_val;
-                    pseudocosts.record_up(node.branching_variable, delta, frac);
-                }
-            }
-        }
-
-        // ── Branching ────────────────────────────────────────────────────────
-        Index branch_var;
-        if (queue.nodes_processed <= PSEUDOCOST_WARMUP_NODES) {
-            branch_var = select_most_fractional(
-                model, std::span<const Scalar>(rel.primal_solution),
-                eff_lo, eff_hi, int_tol);
+        if (is_integer_feasible(working_model, relaxation.primal_solution,
+                                int_tolerance)) {
+            ++queue.nodes_integral;
+            update_incumbent(evaluate_objective(working_model, relaxation.primal_solution),
+                             relaxation.primal_solution);
         } else {
-            branch_var = select_pseudocost(
-                model, std::span<const Scalar>(rel.primal_solution),
-                eff_lo, eff_hi, int_tol, pseudocosts);
-        }
+            std::vector<Scalar> rounded;
+            Scalar rounded_objective = Model::infinity();
+            if (try_rounding(working_model, relaxation.primal_solution, lower, upper,
+                             rounded, rounded_objective, int_tolerance,
+                             options.primal_tolerance)) {
+                update_incumbent(rounded_objective, std::move(rounded));
+            }
 
-        if (branch_var < 0) {
-            // No fractional variable found but not integer-feasible?
-            // This shouldn't happen, but treat as pruned.
-            node.status = NodeStatus::Pruned;
-            queue.nodes_pruned++;
-            continue;
-        }
-
-        node.status = NodeStatus::Branched;
-        const Scalar val = rel.primal_solution[static_cast<std::size_t>(branch_var)];
-        const Scalar floor_val = std::floor(val);
-        const Scalar ceil_val = std::ceil(val);
-
-        // Down child: x_j <= floor(val)
-        if (floor_val >= eff_lo[static_cast<std::size_t>(branch_var)]) {
-            BbNode down;
-            down.id = queue.next_id();
-            down.parent_id = node.id;
-            down.depth = node.depth + 1;
-            down.lower_overrides = node.lower_overrides;
-            down.upper_overrides = node.upper_overrides;
-            down.upper_overrides.push_back({branch_var, floor_val});
-            down.relaxation_bound = node.relaxation_bound;
-            down.relaxation_solution = rel.primal_solution;  // warm start
-            down.branching_variable = branch_var;
-            down.branch_direction = BranchDirection::Down;
-            down.status = NodeStatus::Open;
-            queue.push(std::move(down));
-        }
-
-        // Up child: x_j >= ceil(val)
-        if (ceil_val <= eff_hi[static_cast<std::size_t>(branch_var)]) {
-            BbNode up;
-            up.id = queue.next_id();
-            up.parent_id = node.id;
-            up.depth = node.depth + 1;
-            up.lower_overrides = node.lower_overrides;
-            up.upper_overrides = node.upper_overrides;
-            up.lower_overrides.push_back({branch_var, ceil_val});
-            up.relaxation_bound = node.relaxation_bound;
-            up.relaxation_solution = rel.primal_solution;  // warm start
-            up.branching_variable = branch_var;
-            up.branch_direction = BranchDirection::Up;
-            up.status = NodeStatus::Open;
-            queue.push(std::move(up));
-        }
-
-        // Update global dual bound
-        if (!queue.empty()) {
-            global_dual_bound = queue.best_bound();
-        }
-
-        // Check gap termination
-        if (std::isfinite(incumbent_obj)) {
-            const Scalar ag = compute_absolute_gap(incumbent_obj, global_dual_bound);
-            const Scalar rg = compute_relative_gap(incumbent_obj, global_dual_bound);
-            if (ag <= abs_gap_tol || rg <= rel_gap_tol)
+            const Index branch_variable = queue.nodes_processed <= 8
+                ? select_most_fractional(working_model, relaxation.primal_solution,
+                                         lower, upper, int_tolerance)
+                : select_pseudocost(working_model, relaxation.primal_solution,
+                                    lower, upper, int_tolerance, pseudocosts);
+            if (branch_variable < 0) {
+                termination = SolveStatus::NumericalFailure;
+                result.message = "Relaxation oracle returned a non-integral solution without a branch";
                 break;
+            }
+
+            const auto variable = static_cast<std::size_t>(branch_variable);
+            const Scalar floor_value = std::floor(relaxation.primal_solution[variable]);
+            const Scalar ceil_value = std::ceil(relaxation.primal_solution[variable]);
+            if (floor_value >= lower[variable]) {
+                BbNode down;
+                down.id = queue.next_id();
+                down.parent_id = node.id;
+                down.depth = node.depth + 1;
+                down.lower_overrides = node.lower_overrides;
+                down.upper_overrides = node.upper_overrides;
+                down.upper_overrides.push_back({branch_variable, floor_value});
+                down.relaxation_bound = node_bound;
+                down.relaxation_solution = relaxation.primal_solution;
+                down.branching_variable = branch_variable;
+                down.branch_direction = BranchDirection::Down;
+                queue.push(std::move(down));
+            }
+            if (ceil_value <= upper[variable]) {
+                BbNode up;
+                up.id = queue.next_id();
+                up.parent_id = node.id;
+                up.depth = node.depth + 1;
+                up.lower_overrides = node.lower_overrides;
+                up.upper_overrides = node.upper_overrides;
+                up.lower_overrides.push_back({branch_variable, ceil_value});
+                up.relaxation_bound = node_bound;
+                up.relaxation_solution = relaxation.primal_solution;
+                up.branching_variable = branch_variable;
+                up.branch_direction = BranchDirection::Up;
+                queue.push(std::move(up));
+            }
+        }
+
+        const Scalar best_open_bound = queue.empty() ? incumbent_objective
+                                                       : queue.best_bound();
+        if (all_bounds_certified && std::isfinite(incumbent_objective) &&
+            std::isfinite(node_bound) &&
+            (absolute_gap(incumbent_objective, best_open_bound) <=
+                 options.absolute_gap_tolerance ||
+             relative_gap(incumbent_objective, best_open_bound) <=
+                 options.relative_gap_tolerance)) {
+            termination = SolveStatus::Optimal;
+            break;
         }
     }
 
-    // ── Build result ─────────────────────────────────────────────────────────
-    auto elapsed = std::chrono::steady_clock::now() - start_time;
-    result.solve_seconds = std::chrono::duration<double>(elapsed).count();
+    result.solve_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
     result.nodes = queue.nodes_processed;
     result.iterations = queue.nodes_processed;
-
     if (!incumbent_solution.empty()) {
         result.primal_solution = incumbent_solution;
-        result.objective_value = incumbent_obj;
-        result.primal_bound = incumbent_obj;
+        result.objective_value = incumbent_objective;
+        result.primal_bound = incumbent_objective;
         result.integrality_residual = max_integrality_residual(
-            model, std::span<const Scalar>(incumbent_solution));
+            working_model, incumbent_solution);
     }
 
-    // Global dual bound: best open node, or incumbent if queue exhausted
-    if (queue.empty() && std::isfinite(incumbent_obj)) {
-        global_dual_bound = incumbent_obj;
-    } else if (!queue.empty()) {
-        global_dual_bound = queue.best_bound();
+    result.dual_bound = queue.empty()
+        ? (std::isfinite(incumbent_objective) ? incumbent_objective : Model::infinity())
+        : queue.best_bound();
+    result.absolute_gap = absolute_gap(
+        std::isfinite(incumbent_objective) ? incumbent_objective : Model::infinity(),
+        result.dual_bound);
+    result.relative_gap = relative_gap(
+        std::isfinite(incumbent_objective) ? incumbent_objective : Model::infinity(),
+        result.dual_bound);
+
+    if (termination == SolveStatus::NotSolved) {
+        if (queue.empty() && incumbent_solution.empty()) {
+            termination = SolveStatus::Infeasible;
+        } else if (queue.empty() && all_bounds_certified) {
+            termination = SolveStatus::Optimal;
+        } else {
+            termination = SolveStatus::Feasible;
+        }
     }
-    result.dual_bound = global_dual_bound;
-
-    result.absolute_gap = compute_absolute_gap(
-        std::isfinite(incumbent_obj) ? incumbent_obj : Model::infinity(),
-        global_dual_bound);
-    result.relative_gap = compute_relative_gap(
-        std::isfinite(incumbent_obj) ? incumbent_obj : Model::infinity(),
-        global_dual_bound);
-
-    // Set status
-    if (termination == SolveStatus::TimeLimit) {
-        result.status = std::isfinite(incumbent_obj) ?
-            SolveStatus::TimeLimit : SolveStatus::TimeLimit;
-    } else if (termination == SolveStatus::NodeLimit) {
-        result.status = SolveStatus::NodeLimit;
-    } else if (std::isfinite(incumbent_obj) &&
-               (result.absolute_gap <= abs_gap_tol ||
-                result.relative_gap <= rel_gap_tol)) {
-        result.status = SolveStatus::Optimal;
-    } else if (std::isfinite(incumbent_obj)) {
-        result.status = SolveStatus::Feasible;
-    } else {
-        // Queue exhausted, no incumbent found
-        result.status = SolveStatus::Infeasible;
+    result.status = termination;
+    if (termination == SolveStatus::Optimal &&
+        (!all_bounds_certified ||
+         (result.absolute_gap > options.absolute_gap_tolerance &&
+          result.relative_gap > options.relative_gap_tolerance))) {
+        result.status = incumbent_solution.empty() ? SolveStatus::Infeasible
+                                                    : SolveStatus::Feasible;
     }
-
     return result;
+}
+
+} // namespace
+
+SolveResult solve_mip(const Model &model, const RelaxationOracle &oracle,
+                      const SolverOptions &options) {
+    return solve_mip_impl(model, oracle, options, nullptr);
+}
+
+SolveResult solve_mip(const Model &model, const RelaxationOracle &oracle,
+                      const SolverOptions &options,
+                      const CutGenerator &root_cut_generator) {
+    return solve_mip_impl(model, oracle, options, &root_cut_generator);
 }
 
 } // namespace vikalp

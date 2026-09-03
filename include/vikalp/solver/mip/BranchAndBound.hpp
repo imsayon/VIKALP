@@ -22,6 +22,8 @@
 
 namespace vikalp {
 
+class CutGenerator;
+
 /// Solve a mixed-integer program using branch-and-bound.
 /// Requires a RelaxationOracle that solves the continuous relaxation.
 /// The engine is stateless: all state lives in the returned SolveResult.
@@ -29,5 +31,12 @@ namespace vikalp {
     const Model &model,
     const RelaxationOracle &oracle,
     const SolverOptions &options);
+
+/// Solve a mixed-integer program and apply valid cuts generated once at the root.
+[[nodiscard]] SolveResult solve_mip(
+    const Model &model,
+    const RelaxationOracle &oracle,
+    const SolverOptions &options,
+    const CutGenerator &root_cut_generator);
 
 } // namespace vikalp

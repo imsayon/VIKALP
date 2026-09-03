@@ -41,7 +41,7 @@ public:
     }
 
     [[nodiscard]] BbNode pop() {
-        BbNode top = std::move(const_cast<BbNode &>(queue_.top()));
+        BbNode top = queue_.top();
         queue_.pop();
         return top;
     }

@@ -35,10 +35,11 @@ public:
         std::span<const Scalar> x) const = 0;
 };
 
-/// Trivial rounding cut generator.
-/// For each fractional integer variable x_j, it generates the pair of
-/// cuts x_j <= floor(x_j*) and x_j >= ceil(x_j*) as candidate separators.
-/// This is a teaching-quality generator, not production-grade.
+/// Integer-row rounding cuts.
+///
+/// For a row containing only integer variables and integral coefficients,
+/// activity is integral. A finite fractional row bound can therefore be
+/// rounded inward without excluding any integer-feasible point.
 class RoundingCutGenerator final : public CutGenerator {
 public:
     explicit RoundingCutGenerator(Scalar int_tol = 1e-6) : int_tol_(int_tol) {}

@@ -2,6 +2,7 @@
 
 #include "vikalp/solver/Solver.hpp"
 #include "vikalp/solver/mip/BranchAndBound.hpp"
+#include "vikalp/solver/mip/OuterApproximation.hpp"
 
 #include <span>
 
@@ -43,10 +44,7 @@ SolveResult solve(const Model &model,
     }
 
     case ProblemClass::MINLP: {
-        // Mixed-integer nonlinear → branch-and-bound
-        // Full OA would be solve_oa(), but B&B with NLP relaxation is the
-        // baseline. When OuterApproximation is ready, this will call solve_oa().
-        return solve_mip(model, oracle, options);
+        return solve_oa(model, oracle, options);
     }
     }
 

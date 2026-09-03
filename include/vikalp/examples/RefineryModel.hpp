@@ -18,6 +18,7 @@
 #include "vikalp/contracts/Model.hpp"
 
 #include <string>
+#include <vector>
 
 namespace vikalp {
 
@@ -31,6 +32,11 @@ struct RefineryConfig {
     bool include_quadratic = false;  // add quadratic blending terms
 };
 
+struct RefineryDemoCase {
+    std::string name;
+    RefineryConfig config;
+};
+
 /// Build a refinery MILP/MIQP model from configuration.
 /// The model is a minimization of operating cost subject to
 /// crude selection, blending, unit capacity, and quality constraints.
@@ -41,5 +47,8 @@ struct RefineryConfig {
 [[nodiscard]] RefineryConfig refinery_medium();  // 6 crudes, 4 units, 4 products
 [[nodiscard]] RefineryConfig refinery_large();   // 12 crudes, 8 units, 8 products
 [[nodiscard]] RefineryConfig refinery_xl();      // 20 crudes, 12 units, 12 products
+
+/// Six deterministic MILP/MIQP cases used by the benchmark and demo runner.
+[[nodiscard]] std::vector<RefineryDemoCase> refinery_demo_family();
 
 } // namespace vikalp

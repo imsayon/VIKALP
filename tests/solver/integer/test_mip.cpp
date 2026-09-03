@@ -15,11 +15,13 @@
 #include "vikalp/solver/Solver.hpp"
 #include "vikalp/examples/RefineryModel.hpp"
 #include "vikalp/contracts/RelaxationOracle.hpp"
+#include "vikalp/contracts/NonlinearOracle.hpp"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -79,6 +81,58 @@ public:
 
 private:
     Callback cb_;
+};
+
+class OneVarNonlinearOracle final : public vikalp::NonlinearOracle {
+public:
+    [[nodiscard]] vikalp::Index variables() const noexcept override { return 1; }
+    [[nodiscard]] vikalp::Index constraints() const noexcept override { return 1; }
+    [[nodiscard]] vikalp::Scalar objective(std::span<const vikalp::Scalar>) const override {
+        return 0.0;
+    }
+    void objective_gradient(std::span<const vikalp::Scalar>,
+                            std::span<vikalp::Scalar> gradient) const override {
+        gradient[0] = 0.0;
+    }
+    void constraint_values(std::span<const vikalp::Scalar> x,
+                           std::span<vikalp::Scalar> values) const override {
+        values[0] = x[0] * x[0];
+    }
+    [[nodiscard]] const vikalp::CsrPattern &jacobian_pattern() const noexcept override {
+        return jacobian_;
+    }
+    void jacobian_values(std::span<const vikalp::Scalar> x,
+                         std::span<vikalp::Scalar> values) const override {
+        values[0] = 2.0 * x[0];
+    }
+    [[nodiscard]] const vikalp::CsrPattern &hessian_pattern() const noexcept override {
+        return hessian_;
+    }
+    void hessian_values(std::span<const vikalp::Scalar>, vikalp::Scalar,
+                        std::span<const vikalp::Scalar>,
+                        std::span<vikalp::Scalar> values) const override {
+        values[0] = 2.0;
+    }
+
+private:
+    vikalp::CsrPattern jacobian_{1, 1, {0, 1}, {0}};
+    vikalp::CsrPattern hessian_{1, 1, {0, 1}, {0}};
+};
+
+class CountingRootCutGenerator final : public vikalp::CutGenerator {
+public:
+    [[nodiscard]] std::vector<vikalp::Cut> generate(
+        const vikalp::Model &, std::span<const vikalp::Scalar>) const override {
+        ++calls;
+        vikalp::Cut cut;
+        cut.indices = {0};
+        cut.coefficients = {1.0};
+        cut.lower = -vikalp::Model::infinity();
+        cut.upper = 10.0;
+        return {cut};
+    }
+
+    mutable int calls = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -191,6 +245,10 @@ void test_two_level_branch() {
             // Root
             r.objective_value = 1.5;
             r.primal_solution = {1.5};
+        } else if (hi[0] <= 0.0 + 1e-9) {
+            // x<=0: integer
+            r.objective_value = 0.0;
+            r.primal_solution = {0.0};
         } else if (hi[0] <= 1.0 + 1e-9 && lo[0] <= 0.0 + 1e-9) {
             // x<=1: still fractional at 0.5
             r.objective_value = 0.5;
@@ -199,10 +257,6 @@ void test_two_level_branch() {
             // x>=2: integer
             r.objective_value = 2.0;
             r.primal_solution = {2.0};
-        } else if (hi[0] <= 0.0 + 1e-9) {
-            // x<=0: integer
-            r.objective_value = 0.0;
-            r.primal_solution = {0.0};
         } else if (lo[0] >= 1.0 - 1e-9 && hi[0] <= 1.0 + 1e-9) {
             // x=1: integer
             r.objective_value = 1.0;
@@ -678,20 +732,71 @@ void test_pseudocost_tracker() {
 // 24. Rounding cut generator
 void test_rounding_cut_generator() {
     auto model = make_2var_mixed(1.0, 1.0, 0.0, 10.0, 0.0, 10.0);
+    model.constraint_matrix = {{1, 2, {0, 1}, {0}}, {1.0}};
+    model.constraint_lower = {-vikalp::Model::infinity()};
+    model.constraint_upper = {2.5};
     vikalp::RoundingCutGenerator gen;
-    // x0 is integer at 2.4, x1 is continuous at 3.7
+    // Integer row activity is integral, so the fractional upper bound can be rounded.
     std::vector<double> sol = {2.4, 3.7};
     auto cuts = gen.generate(model, std::span<const double>(sol));
 
-    // Should generate 2 cuts for x0 (down: <= 2, up: >= 3), none for x1
-    check_eq("cuts: count", static_cast<double>(cuts.size()), 2.0);
-    if (cuts.size() >= 2) {
+    check_eq("cuts: count", static_cast<double>(cuts.size()), 1.0);
+    if (!cuts.empty()) {
         check_eq("cuts[0]: upper", cuts[0].upper, 2.0);
-        check_eq("cuts[1]: lower", cuts[1].lower, 3.0);
     }
 }
 
-// 25. Solver router for continuous LP
+// 25. Root cuts are applied once and re-solve the root relaxation
+void test_root_cut_integration() {
+    auto model = make_1var_milp(1.0, 0.0, 10.0);
+    CountingRootCutGenerator generator;
+    bool saw_cut = false;
+    MockRelaxationOracle oracle([&](auto &m, auto, auto, auto, auto) {
+        saw_cut = saw_cut || m.num_constraints() == 1;
+        vikalp::SolveResult r;
+        r.status = vikalp::SolveStatus::Optimal;
+        r.objective_value = 1.0;
+        r.dual_bound = 1.0;
+        r.primal_solution = {1.0};
+        return r;
+    });
+    auto res = vikalp::solve_mip(model, oracle, test_options(), generator);
+    check_true("root_cut: optimal", res.status == vikalp::SolveStatus::Optimal);
+    check_true("root_cut: applied", saw_cut);
+    check_eq("root_cut: generated once", static_cast<double>(generator.calls), 1.0);
+}
+
+// 26. Quadratic objective is included in the incumbent value
+void test_quadratic_objective_evaluation() {
+    auto model = make_1var_milp(0.0, 0.0, 3.0);
+    model.quadratic_objective = {{1, 1, {0, 1}, {0}}, {2.0}};
+    MockRelaxationOracle oracle([](auto &, auto, auto, auto, auto) {
+        vikalp::SolveResult r;
+        r.status = vikalp::SolveStatus::Optimal;
+        r.objective_value = 0.0;
+        r.primal_solution = {2.0};
+        return r;
+    });
+    auto res = vikalp::solve_mip(model, oracle, test_options());
+    check_true("quadratic: optimal", res.status == vikalp::SolveStatus::Optimal);
+    check_eq("quadratic: objective", res.objective_value, 4.0);
+}
+
+// 27. Invalid relaxation output is reported, never silently pruned
+void test_invalid_relaxation_output() {
+    auto model = make_1var_milp(1.0, 0.0, 1.0);
+    MockRelaxationOracle oracle([](auto &, auto, auto, auto, auto) {
+        vikalp::SolveResult r;
+        r.status = vikalp::SolveStatus::Optimal;
+        r.objective_value = 0.0;
+        return r;
+    });
+    auto res = vikalp::solve_mip(model, oracle, test_options());
+    check_true("invalid_relaxation: numerical failure",
+               res.status == vikalp::SolveStatus::NumericalFailure);
+}
+
+// 28. Solver router for continuous LP
 void test_solver_router_lp() {
     vikalp::Model model;
     model.linear_objective = {1.0, 2.0};
@@ -713,7 +818,7 @@ void test_solver_router_lp() {
     check_true("router_lp: solver name", res.solver == "vikalp-continuous");
 }
 
-// 26. Solver router for MILP
+// 29. Solver router for MILP
 void test_solver_router_milp() {
     auto model = make_1var_milp(1.0, 0.0, 10.0);
     MockRelaxationOracle oracle([](auto &, auto, auto, auto, auto) {
@@ -729,25 +834,48 @@ void test_solver_router_milp() {
     check_true("router_milp: solver name", res.solver == "vikalp-mip-bnb");
 }
 
-// 27. Outer approximation
+// 30. Outer approximation
 void test_outer_approximation() {
-    auto model = make_1var_milp(1.0, 0.0, 10.0);
-    MockRelaxationOracle oracle([](auto &, auto, auto, auto, auto) {
+    vikalp::Model model;
+    model.linear_objective = {1.0};
+    model.variable_lower = {0.0};
+    model.variable_upper = {3.0};
+    model.variable_types = {vikalp::VariableType::Integer};
+    model.constraint_matrix = {{1, 1, {0, 0}, {}}, {}};
+    model.constraint_lower = {-vikalp::Model::infinity()};
+    model.constraint_upper = {4.0};
+    model.nonlinear = std::make_shared<OneVarNonlinearOracle>();
+
+    MockRelaxationOracle oracle([](auto &model, auto, auto, auto, auto) {
         vikalp::SolveResult r;
         r.status = vikalp::SolveStatus::Optimal;
-        r.objective_value = 2.0;
-        r.primal_solution = {2.0};
+        if (model.nonlinear) {
+            r.objective_value = 0.5;
+            r.primal_solution = {0.5};
+        } else {
+            r.objective_value = 1.0;
+            r.dual_bound = 1.0;
+            r.primal_solution = {1.0, 0.0};
+        }
         return r;
     });
 
     auto res = vikalp::solve_oa(model, oracle, test_options());
-    check_true("oa: optimal or feasible", res.status == vikalp::SolveStatus::Optimal ||
-                                          res.status == vikalp::SolveStatus::Feasible);
+    check_true("oa: optimal", res.status == vikalp::SolveStatus::Optimal);
+    check_eq("oa: objective", res.objective_value, 1.0);
     check_true("oa: solver name", res.solver == "vikalp-oa");
+    auto routed = vikalp::solve(model, oracle, test_options());
+    check_true("oa: router", routed.solver == "vikalp-oa");
 }
 
-// 28. Refinery model generation and validation
+// 31. Refinery model generation and validation
 void test_refinery_model_generation_and_validation() {
+    const auto demos = vikalp::refinery_demo_family();
+    check_eq("refinery_family: six cases", static_cast<double>(demos.size()), 6.0);
+    for (const auto &demo : demos) {
+        check_true("refinery_family: valid",
+                   vikalp::build_refinery_model(demo.config).validate().empty());
+    }
     auto small = vikalp::build_refinery_model(vikalp::refinery_small());
     auto errors = small.validate();
     check_true("refinery_small: valid", errors.empty());
@@ -763,7 +891,7 @@ void test_refinery_model_generation_and_validation() {
     check_true("refinery_lg: valid", lg_errs.empty());
 }
 
-// 29. Refinery MIQP generation
+// 32. Refinery MIQP generation
 void test_refinery_miqp_generation() {
     auto cfg = vikalp::refinery_small();
     cfg.include_quadratic = true;
@@ -775,24 +903,23 @@ void test_refinery_miqp_generation() {
     check_true("refinery_miqp: is MIQP", miqp.problem_class() == vikalp::ProblemClass::MIQP);
 }
 
-// 30. Refinery solve pipeline
+// 33. Refinery solve pipeline
 void test_refinery_solve_pipeline() {
     auto model = vikalp::build_refinery_model(vikalp::refinery_small());
-    MockRelaxationOracle oracle([](const vikalp::Model &m, auto lo, auto, auto, auto) {
+    MockRelaxationOracle oracle([](const vikalp::Model &m, auto, auto, auto, auto) {
         vikalp::SolveResult r;
         r.status = vikalp::SolveStatus::Optimal;
         const auto n = static_cast<std::size_t>(m.num_variables());
         r.primal_solution.assign(n, 0.0);
-        double obj = 0.0;
-        for (std::size_t i = 0; i < n; ++i) {
-            double val = lo.empty() ? m.variable_lower[i] : lo[i];
-            if (m.variable_types[i] != vikalp::VariableType::Continuous) {
-                val = std::round(val);
-            }
-            r.primal_solution[i] = val;
-            obj += m.linear_objective[i] * val;
-        }
-        r.objective_value = obj;
+        // Select crude 0, activate unit 0, and meet both product demands.
+        r.primal_solution[0] = 1.0;
+        r.primal_solution[3] = 60.0;
+        r.primal_solution[6] = 1.0;
+        r.primal_solution[8] = 30.0;
+        r.primal_solution[9] = 30.0;
+        r.primal_solution[10] = 30.0;
+        r.primal_solution[11] = 30.0;
+        r.objective_value = 695.0;
         return r;
     });
 
@@ -832,15 +959,18 @@ int main() {
     test_effective_bounds();        // 22
     test_pseudocost_tracker();      // 23
     test_rounding_cut_generator();  // 24
-    test_solver_router_lp();        // 25
-    test_solver_router_milp();      // 26
-    test_outer_approximation();     // 27
-    test_refinery_model_generation_and_validation(); // 28
-    test_refinery_miqp_generation(); // 29
-    test_refinery_solve_pipeline(); // 30
+    test_root_cut_integration();    // 25
+    test_quadratic_objective_evaluation(); // 26
+    test_invalid_relaxation_output(); // 27
+    test_solver_router_lp();        // 28
+    test_solver_router_milp();      // 29
+    test_outer_approximation();     // 30
+    test_refinery_model_generation_and_validation(); // 31
+    test_refinery_miqp_generation(); // 32
+    test_refinery_solve_pipeline(); // 33
 
     if (g_failures == 0) {
-        std::printf("ALL %d MIP TESTS PASSED\n", 30);
+        std::printf("ALL %d MIP TESTS PASSED\n", 33);
         return 0;
     }
     std::printf("%d MIP TEST(S) FAILED\n", g_failures);

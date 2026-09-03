@@ -19,9 +19,10 @@
 
 namespace vikalp {
 
-/// Solve a MINLP using outer approximation.
-/// Requires: model.nonlinear is set, model has integer variables.
-/// The oracle solves the MILP master problems.
+/// Solve a convex MINLP using outer approximation.
+/// Requires: model.nonlinear is set, model has integer variables, and the
+/// nonlinear oracle's tangent data satisfies the convex OA contract.
+/// The relaxation oracle solves the linearized MILP master problems.
 [[nodiscard]] SolveResult solve_oa(
     const Model &model,
     const RelaxationOracle &oracle,
