@@ -37,10 +37,11 @@ GPU acceleration matters only where measurement shows a real benefit without wea
 
 - Gate 0 public solver contracts are frozen under `include/vikalp/contracts`
 - Canonical sparse-model validation and a runnable contract check are implemented
+- A deterministic CPU execution backend and CPU correctness tests are implemented
+- An optional CUDA/cuSPARSE backend exists behind `VIKALP_ENABLE_CUDA`; hardware validation and profiling are pending
 - No optimization algorithm implementation yet
 - No supported file format or stable end-user API yet
-- No GPU or benchmark claims
-- Solver internals and external dependencies beyond C++20/CMake remain undecided
+- No GPU-performance or benchmark claims
 
 ## Starting references
 
