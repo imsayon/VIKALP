@@ -18,6 +18,7 @@ struct SolverOptions {
     Index iteration_limit = 100'000;
     Index node_limit = 100'000;
     Scalar time_limit_seconds = Model::infinity();
+    // Feasibility and KKT residual limits in original, unscaled coordinates.
     Scalar primal_tolerance = 1e-7;
     Scalar dual_tolerance = 1e-7;
     Scalar integrality_tolerance = 1e-6;

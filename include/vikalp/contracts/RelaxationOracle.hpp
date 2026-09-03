@@ -12,6 +12,7 @@ class RelaxationOracle {
 public:
     virtual ~RelaxationOracle() = default;
 
+    // Override and warm-start spans are either empty or num_variables() long.
     // Empty overrides use model bounds; an empty warm start means cold start.
     [[nodiscard]] virtual SolveResult solve(
         const Model &model,

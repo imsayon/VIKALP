@@ -40,6 +40,8 @@ enum class ProblemClass { LP,
 //   s.t. row_lower <= Ax + g(x) <= row_upper
 //        variable_lower <= x <= variable_upper
 // Q is stored as a full symmetric CSR matrix. An absent Q is the default 0x0 matrix.
+// This public model stays in original coordinates. Presolve owns its reversible
+// mapping internally and must postsolve every public SolveResult back to this model.
 struct Model {
     std::string name;
     std::vector<Scalar> linear_objective;
