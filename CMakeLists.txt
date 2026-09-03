@@ -10,4 +10,8 @@ if(BUILD_TESTING)
     add_executable(vikalp_contracts_test tests/contracts/contracts_test.cpp)
     target_link_libraries(vikalp_contracts_test PRIVATE vikalp_contracts)
     add_test(NAME contracts COMMAND vikalp_contracts_test)
+
+    add_executable(vikalp_model_validation_test tests/model/model_validation_test.cpp)
+    target_link_libraries(vikalp_model_validation_test PRIVATE vikalp_contracts)
+    add_test(NAME model_validation COMMAND vikalp_model_validation_test)
 endif()
