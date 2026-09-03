@@ -55,9 +55,24 @@ if(VIKALP_ENABLE_CUDA)
     endif()
 endif()
 
+# ── Flow D: Mixed-integer engine ──────────────────────────────────────────────
+add_library(vikalp_mip STATIC
+    src/solver/mip/BranchAndBound.cpp
+    src/solver/mip/CutGenerator.cpp
+    src/solver/mip/OuterApproximation.cpp
+    src/solver/Solver.cpp
+    src/examples/RefineryModel.cpp
+)
+target_include_directories(vikalp_mip PUBLIC include)
+target_link_libraries(vikalp_mip PUBLIC vikalp_contracts)
+target_compile_features(vikalp_mip PUBLIC cxx_std_20)
+
+add_executable(vikalp_benchmark tools/benchmark_runner.cpp)
+target_link_libraries(vikalp_benchmark PRIVATE vikalp_mip)
+target_compile_features(vikalp_benchmark PUBLIC cxx_std_20)
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 if(BUILD_TESTING)
-    # Existing contracts test — unchanged
     add_executable(vikalp_contracts_test tests/contracts/contracts_test.cpp)
     target_link_libraries(vikalp_contracts_test PRIVATE vikalp_contracts)
     add_test(NAME contracts COMMAND vikalp_contracts_test)
@@ -78,7 +93,6 @@ if(BUILD_TESTING)
     set_tests_properties(mps_reader PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 
-    # Flow B backend correctness tests
     add_executable(vikalp_backend_test tests/test_backend.cpp)
     target_link_libraries(vikalp_backend_test PRIVATE vikalp_backend)
     add_test(NAME backend COMMAND vikalp_backend_test)
@@ -86,4 +100,8 @@ if(BUILD_TESTING)
     add_executable(vikalp_continuous_test tests/solver/continuous/test_pdhg.cpp)
     target_link_libraries(vikalp_continuous_test PRIVATE vikalp_solvers)
     add_test(NAME continuous COMMAND vikalp_continuous_test)
+
+    add_executable(vikalp_mip_test tests/solver/integer/test_mip.cpp)
+    target_link_libraries(vikalp_mip_test PRIVATE vikalp_mip)
+    add_test(NAME mip COMMAND vikalp_mip_test)
 endif()

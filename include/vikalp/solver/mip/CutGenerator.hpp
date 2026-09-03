@@ -1,0 +1,55 @@
+#pragma once
+
+// Flow D — Cut generator interface.
+//
+// Cuts are linear constraints added to tighten the relaxation.
+// A CutGenerator inspects a relaxation solution and produces zero
+// or more cuts. Each cut is a row: lower <= a'x <= upper.
+
+#include "vikalp/contracts/Model.hpp"
+
+#include <span>
+#include <vector>
+
+namespace vikalp {
+
+/// A single linear cut: lower <= coefficients'x <= upper.
+struct Cut {
+    std::vector<Index> indices;       // variable indices (sorted, unique)
+    std::vector<Scalar> coefficients; // same length as indices
+    Scalar lower = -Model::infinity();
+    Scalar upper = Model::infinity();
+};
+
+/// Abstract interface for cut generators (Gomory, MIR, etc.)
+class CutGenerator {
+public:
+    virtual ~CutGenerator() = default;
+
+    /// Generate cuts given the current relaxation solution.
+    /// model: the original MILP
+    /// x: relaxation primal solution
+    /// Returns a (possibly empty) vector of cuts.
+    [[nodiscard]] virtual std::vector<Cut> generate(
+        const Model &model,
+        std::span<const Scalar> x) const = 0;
+};
+
+/// Integer-row rounding cuts.
+///
+/// For a row containing only integer variables and integral coefficients,
+/// activity is integral. A finite fractional row bound can therefore be
+/// rounded inward without excluding any integer-feasible point.
+class RoundingCutGenerator final : public CutGenerator {
+public:
+    explicit RoundingCutGenerator(Scalar int_tol = 1e-6) : int_tol_(int_tol) {}
+
+    [[nodiscard]] std::vector<Cut> generate(
+        const Model &model,
+        std::span<const Scalar> x) const override;
+
+private:
+    Scalar int_tol_;
+};
+
+} // namespace vikalp

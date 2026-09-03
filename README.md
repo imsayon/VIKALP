@@ -14,7 +14,10 @@ The initial target is a numerical engine for:
 - Mixed-Integer Linear Programming (MILP)
 - Convex Quadratic Programming (QP)
 
-These are goals, not current capabilities. The repository is presently in research and specification.
+The continuous and mixed-integer layers are developed independently. Flow D
+provides the mixed-integer controller and refinery smoke path through the
+`RelaxationOracle` contract; a production LP/QP/NLP relaxation oracle is still
+separate work.
 
 ## What VIKALP is not
 
@@ -41,6 +44,8 @@ GPU acceleration matters only where measurement shows a real benefit without wea
 - An optional CUDA/cuSPARSE backend exists behind `VIKALP_ENABLE_CUDA`; hardware validation and profiling are pending
 - Flow C continuous baselines are implemented for bounded LP (restarted/preconditioned PDHG), convex QP (PDQP), and smooth NLP (primal-dual IPM)
 - Flow C analytic tests cover optimal solutions, row bounds, convexity rejection, warm starts, bound overrides, equality constraints, and residuals
+- Flow D branch-and-bound, convex outer approximation, refinery cases, and reproducible benchmark tooling are implemented
+- Flow D tests use a mock/feasible relaxation oracle; they are not performance or production-solver claims
 - No supported file format or stable end-user API yet
 - CUDA uses the same `ExecutionBackend` solver contract, but GPU runtime and performance claims remain unverified
 
