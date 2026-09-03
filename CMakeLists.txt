@@ -18,6 +18,16 @@ add_library(vikalp_backend STATIC src/backend/cpu_ops.cpp)
 target_link_libraries(vikalp_backend PUBLIC vikalp_contracts)
 target_compile_features(vikalp_backend PUBLIC cxx_std_20)
 
+# ── Flow C: continuous solvers ───────────────────────────────────────────────
+add_library(vikalp_solvers STATIC
+    src/solver/lp/pdhg.cpp
+    src/solver/qp/pdqp.cpp
+    src/solver/nlp/ipm.cpp
+)
+target_include_directories(vikalp_solvers PUBLIC include)
+target_link_libraries(vikalp_solvers PUBLIC vikalp_backend)
+target_compile_features(vikalp_solvers PUBLIC cxx_std_20)
+
 # ── Optional Flow B CUDA backend ──────────────────────────────────────────────
 # CUDA is only compiled when real hardware AND toolkit are confirmed present.
 # Set -DVIKALP_ENABLE_CUDA=ON on the cmake command line to enable.
@@ -72,4 +82,8 @@ if(BUILD_TESTING)
     add_executable(vikalp_backend_test tests/test_backend.cpp)
     target_link_libraries(vikalp_backend_test PRIVATE vikalp_backend)
     add_test(NAME backend COMMAND vikalp_backend_test)
+
+    add_executable(vikalp_continuous_test tests/solver/continuous/test_pdhg.cpp)
+    target_link_libraries(vikalp_continuous_test PRIVATE vikalp_solvers)
+    add_test(NAME continuous COMMAND vikalp_continuous_test)
 endif()

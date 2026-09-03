@@ -1,239 +1,233 @@
-#include "vikalp/contracts/Model.hpp"
-#include "vikalp/contracts/SolveResult.hpp"
-#include "vikalp/contracts/ExecutionBackend.hpp"
-#include <iostream>
-#include <vector>
-#include <memory>
+#include "vikalp/backend/CpuBackend.hpp"
+#include "vikalp/contracts/NonlinearOracle.hpp"
+#include "vikalp/solver/continuous.hpp"
+
 #include <cmath>
-#include <cassert>
-// Add forward declaration near top of file
-namespace vikalp::solver::nlp {
-    SolveResult solve_nlp_ipm_baseline(const Model& model, ExecutionBackend& backend, Index max_iterations);
-}
-// Forward declarations of your Flow C solvers
-namespace vikalp::solver::lp {
-    SolveResult solve_pdhg_baseline(const Model& model, ExecutionBackend& backend, Index max_iterations);
+#include <iostream>
+#include <memory>
+#include <span>
+#include <vector>
+
+namespace {
+
+int failures = 0;
+
+void expect(bool condition, const char *message) {
+    if (!condition) {
+        std::cerr << "FAIL: " << message << '\n';
+        ++failures;
+    }
 }
 
-namespace vikalp::solver::qp {
-    SolveResult solve_pdqp_baseline(const Model& model, ExecutionBackend& backend, Index max_iterations);
+void expect_near(double actual, double expected, double tolerance,
+                const char *message) {
+    expect(std::isfinite(actual) && std::abs(actual - expected) <= tolerance,
+           message);
 }
 
-namespace vikalp {
-
-// Linker stubs for Model member methods if not compiled separately yet
-Index Model::num_variables() const noexcept {
-    return linear_objective.size();
-}
-Index Model::num_constraints() const noexcept {
-    return constraint_matrix.pattern.rows;
-}
-bool Model::has_quadratic_objective() const noexcept {
-    return !quadratic_objective.values.empty();
+vikalp::Model bounded_linear(double objective, double lower, double upper) {
+    vikalp::Model model;
+    model.name = "bounded-linear";
+    model.linear_objective = {objective};
+    model.variable_lower = {lower};
+    model.variable_upper = {upper};
+    model.variable_types = {vikalp::VariableType::Continuous};
+    model.constraint_matrix.pattern = {0, 1, {0}, {}};
+    return model;
 }
 
-// 1. Lightweight Mock Vector
-class MockVector : public BackendVector {
+class QuadraticOracle final : public vikalp::NonlinearOracle {
 public:
-    std::vector<Scalar> data;
-    explicit MockVector(Index size) : data(size, 0.0) {}
-    [[nodiscard]] Index size() const noexcept override { return data.size(); }
+    explicit QuadraticOracle(bool equality) : equality_(equality) {}
+
+    [[nodiscard]] vikalp::Index variables() const noexcept override { return 1; }
+    [[nodiscard]] vikalp::Index constraints() const noexcept override {
+        return equality_ ? 1 : 0;
+    }
+    [[nodiscard]] vikalp::Scalar objective(std::span<const vikalp::Scalar> x) const override {
+        const auto error = x[0] - 2.0;
+        return error * error;
+    }
+    void objective_gradient(std::span<const vikalp::Scalar> x,
+                            std::span<vikalp::Scalar> gradient) const override {
+        gradient[0] = 2.0 * (x[0] - 2.0);
+    }
+    void constraint_values(std::span<const vikalp::Scalar> x,
+                           std::span<vikalp::Scalar> values) const override {
+        if (equality_) values[0] = x[0];
+    }
+    [[nodiscard]] const vikalp::CsrPattern &jacobian_pattern() const noexcept override {
+        return jacobian_;
+    }
+    void jacobian_values(std::span<const vikalp::Scalar>,
+                         std::span<vikalp::Scalar> values) const override {
+        if (equality_) values[0] = 1.0;
+    }
+    [[nodiscard]] const vikalp::CsrPattern &hessian_pattern() const noexcept override {
+        return hessian_;
+    }
+    void hessian_values(std::span<const vikalp::Scalar>, vikalp::Scalar,
+                        std::span<const vikalp::Scalar>,
+                        std::span<vikalp::Scalar> values) const override {
+        values[0] = 2.0;
+    }
+
+private:
+    bool equality_;
+    vikalp::CsrPattern jacobian_{
+        equality_ ? 1 : 0, 1, equality_ ? std::vector<vikalp::Index>{0, 1}
+                                        : std::vector<vikalp::Index>{0},
+        equality_ ? std::vector<vikalp::Index>{0} : std::vector<vikalp::Index>{}};
+    vikalp::CsrPattern hessian_{1, 1, {0, 1}, {0}};
 };
 
-// 2. Lightweight Mock Matrix
-class MockMatrix : public BackendMatrix {
-public:
-    CsrPattern pat;
-    std::vector<Scalar> vals;
-    explicit MockMatrix(const CsrPattern& pattern) : pat(pattern) {}
-    [[nodiscard]] Index rows() const noexcept override { return pat.rows; }
-    [[nodiscard]] Index columns() const noexcept override { return pat.columns; }
-};
+vikalp::Model nonlinear_model(bool equality) {
+    vikalp::Model model;
+    model.name = equality ? "constrained-nlp" : "unconstrained-nlp";
+    model.linear_objective = {0.0};
+    model.variable_lower = {-10.0};
+    model.variable_upper = {10.0};
+    model.variable_types = {vikalp::VariableType::Continuous};
+    model.constraint_matrix.pattern = {equality ? 1 : 0, 1,
+                                       equality ? std::vector<vikalp::Index>{0, 1}
+                                                : std::vector<vikalp::Index>{0},
+                                       equality ? std::vector<vikalp::Index>{0}
+                                                : std::vector<vikalp::Index>{}};
+    model.constraint_matrix.values = equality ? std::vector<vikalp::Scalar>{0.0}
+                                              : std::vector<vikalp::Scalar>{};
+    model.constraint_lower = equality ? std::vector<vikalp::Scalar>{1.0}
+                                      : std::vector<vikalp::Scalar>{};
+    model.constraint_upper = model.constraint_lower;
+    model.nonlinear = std::make_shared<QuadraticOracle>(equality);
+    return model;
+}
 
-// 3. Mock ExecutionBackend
-class MockExecutionBackend : public ExecutionBackend {
-public:
-    [[nodiscard]] std::unique_ptr<BackendVector> create_vector(Index size) override {
-        return std::make_unique<MockVector>(size);
-    }
-    [[nodiscard]] std::unique_ptr<BackendMatrix> create_matrix(const CsrPattern &pattern) override {
-        return std::make_unique<MockMatrix>(pattern);
-    }
-    void upload(std::span<const Scalar> source, BackendVector &target) override {
-        auto& v = dynamic_cast<MockVector&>(target);
-        v.data.assign(source.begin(), source.end());
-    }
-    void download(const BackendVector &source, std::span<Scalar> target) const override {
-        auto& v = dynamic_cast<const MockVector&>(source);
-        std::copy(v.data.begin(), v.data.end(), target.begin());
-    }
-    void set_values(std::span<const Scalar> values, BackendMatrix &target) override {
-        auto& m = dynamic_cast<MockMatrix&>(target);
-        m.vals.assign(values.begin(), values.end());
-    }
-    void fill(BackendVector &target, Scalar value) override {
-        auto& v = dynamic_cast<MockVector&>(target);
-        std::fill(v.data.begin(), v.data.end(), value);
-    }
-    void copy(const BackendVector &source, BackendVector &target) override {
-        auto& s = dynamic_cast<const MockVector&>(source);
-        auto& t = dynamic_cast<MockVector&>(target);
-        t.data = s.data;
-    }
-    void axpby(Scalar alpha, const BackendVector &x, Scalar beta, BackendVector &y) override {
-        auto& xv = dynamic_cast<const MockVector&>(x);
-        auto& yv = dynamic_cast<MockVector&>(y);
-        for (size_t i = 0; i < yv.data.size(); ++i) {
-            yv.data[i] = alpha * xv.data[i] + beta * yv.data[i];
-        }
-    }
-    [[nodiscard]] Scalar dot(const BackendVector &x, const BackendVector &y) override {
-        auto& xv = dynamic_cast<const MockVector&>(x);
-        auto& yv = dynamic_cast<const MockVector&>(y);
-        Scalar sum = 0.0;
-        for (size_t i = 0; i < xv.data.size(); ++i) sum += xv.data[i] * yv.data[i];
-        return sum;
-    }
-    [[nodiscard]] Scalar norm_inf(const BackendVector &x) override {
-        auto& xv = dynamic_cast<const MockVector&>(x);
-        Scalar max_val = 0.0;
-        for (auto val : xv.data) max_val = std::max(max_val, std::abs(val));
-        return max_val;
-    }
-    void project_box(BackendVector &x, const BackendVector &lower, const BackendVector &upper) override {
-        auto& xv = dynamic_cast<MockVector&>(x);
-        auto& lv = dynamic_cast<const MockVector&>(lower);
-        auto& uv = dynamic_cast<const MockVector&>(upper);
-        for (size_t i = 0; i < xv.data.size(); ++i) {
-            xv.data[i] = std::clamp(xv.data[i], lv.data[i], uv.data[i]);
-        }
-    }
-    void multiply(Scalar alpha, const BackendMatrix &matrix, const BackendVector &x, Scalar beta, BackendVector &y, Transpose transpose) override {
-        auto& m = dynamic_cast<const MockMatrix&>(matrix);
-        auto& xv = dynamic_cast<const MockVector&>(x);
-        auto& yv = dynamic_cast<MockVector&>(y);
-        
-        for (size_t i = 0; i < yv.data.size(); ++i) yv.data[i] *= beta;
+void test_lp(vikalp::ExecutionBackend &backend) {
+    vikalp::SolverOptions options;
+    options.iteration_limit = 5000;
+    options.primal_tolerance = 1e-5;
+    options.dual_tolerance = 1e-5;
 
-        if (transpose == Transpose::No) {
-            for (Index i = 0; i < m.pat.rows; ++i) {
-                Scalar sum = 0.0;
-                for (Index j = m.pat.row_offsets[i]; j < m.pat.row_offsets[i+1]; ++j) {
-                    sum += m.vals[j] * xv.data[m.pat.column_indices[j]];
-                }
-                yv.data[i] += alpha * sum;
-            }
-        } else {
-            for (Index i = 0; i < m.pat.rows; ++i) {
-                for (Index j = m.pat.row_offsets[i]; j < m.pat.row_offsets[i+1]; ++j) {
-                    Index col = m.pat.column_indices[j];
-                    yv.data[col] += alpha * m.vals[j] * xv.data[i];
-                }
-            }
-        }
-    }
-    [[nodiscard]] LinearSolveResult solve_linear_system(const BackendMatrix &, const BackendVector &, BackendVector &, MatrixProperty, Scalar, Index) override {
-        return {true, 1, 0.0};
-    }
-    void synchronize() override {} // Added override here
-};
+    auto model = bounded_linear(-1.0, 0.0, 10.0);
+    const auto result = vikalp::solver::solve_lp(model, backend, options);
+    expect(result.status == vikalp::SolveStatus::Optimal, "LP reaches optimal status");
+    expect_near(result.primal_solution[0], 10.0, 1e-5, "LP respects active upper bound");
+    expect_near(result.objective_value, -10.0, 1e-5, "LP objective is correct");
+    expect(result.primal_residual <= options.primal_tolerance, "LP residual is reported");
 
-} // namespace vikalp
+    model.variable_upper = {20.0};
+    model.constraint_matrix.pattern = {1, 1, {0, 1}, {0}};
+    model.constraint_matrix.values = {1.0};
+    model.constraint_lower = {-vikalp::Model::infinity()};
+    model.constraint_upper = {3.0};
+    const auto constrained = vikalp::solver::solve_lp(model, backend, options);
+    expect(constrained.status == vikalp::SolveStatus::Optimal,
+           "LP handles two-sided row bounds");
+    expect_near(constrained.primal_solution[0], 3.0, 1e-4,
+                "LP enforces the row upper bound");
+
+    const std::vector<vikalp::Scalar> warm_start = {2.0};
+    const std::vector<vikalp::Scalar> upper_override = {4.0};
+    vikalp::solver::LpRelaxationOracle oracle;
+    const auto relaxed = oracle.solve(model, {}, upper_override, warm_start, options);
+    expect(relaxed.status == vikalp::SolveStatus::Optimal,
+           "LP relaxation oracle returns a solved result");
+    expect_near(relaxed.primal_solution[0], 3.0, 1e-4,
+                "LP relaxation accepts warm start and bound override");
+}
+
+void test_qp(vikalp::ExecutionBackend &backend) {
+    auto model = bounded_linear(-10.0, 0.0, 10.0);
+    model.name = "convex-qp";
+    model.quadratic_objective.pattern = {1, 1, {0, 1}, {0}};
+    model.quadratic_objective.values = {2.0};
+    vikalp::SolverOptions options;
+    options.iteration_limit = 1000;
+    options.primal_tolerance = 1e-6;
+    options.dual_tolerance = 1e-6;
+    const auto result = vikalp::solver::solve_qp(model, backend, options);
+    expect(result.status == vikalp::SolveStatus::Optimal, "convex QP reaches optimal status");
+    expect_near(result.primal_solution[0], 5.0, 1e-4, "QP reaches analytic minimizer");
+    expect_near(result.objective_value, -25.0, 1e-4, "QP objective is correct");
+    const std::vector<vikalp::Scalar> upper_override = {4.0};
+    const std::vector<vikalp::Scalar> warm_start = {1.0};
+    vikalp::solver::QpRelaxationOracle oracle;
+    const auto relaxed = oracle.solve(model, {}, upper_override, warm_start, options);
+    expect(relaxed.status == vikalp::SolveStatus::Optimal,
+           "QP relaxation oracle returns a solved result");
+    expect_near(relaxed.primal_solution[0], 4.0, 1e-4,
+                "QP relaxation applies a warm start and bound override");
+
+    model.quadratic_objective.values = {-2.0};
+    const auto nonconvex = vikalp::solver::solve_qp(model, backend, options);
+    expect(nonconvex.status == vikalp::SolveStatus::UnsupportedModel,
+           "nonconvex QP is rejected explicitly");
+}
+
+void test_nlp(vikalp::ExecutionBackend &backend) {
+    vikalp::SolverOptions options;
+    options.iteration_limit = 50;
+    options.primal_tolerance = 1e-6;
+    options.dual_tolerance = 1e-6;
+
+    const auto unconstrained = vikalp::solver::solve_nlp(
+        nonlinear_model(false), backend, options);
+    expect(unconstrained.status == vikalp::SolveStatus::LocallyOptimal,
+           "NLP IPM solves an analytic smooth objective");
+    expect_near(unconstrained.primal_solution[0], 2.0, 1e-6,
+                "NLP reaches analytic minimizer");
+
+    const auto constrained = vikalp::solver::solve_nlp(
+        nonlinear_model(true), backend, options);
+    expect(constrained.status == vikalp::SolveStatus::LocallyOptimal,
+           "NLP IPM handles an analytic equality constraint");
+    expect_near(constrained.primal_solution[0], 1.0, 1e-5,
+                "NLP satisfies equality constraint");
+    expect(constrained.primal_residual <= options.primal_tolerance,
+           "NLP reports equality residual");
+}
+
+void test_failure_paths(vikalp::ExecutionBackend &backend) {
+    vikalp::SolverOptions options;
+    options.iteration_limit = 20;
+    auto invalid = bounded_linear(1.0, 3.0, 2.0);
+    const auto invalid_result = vikalp::solver::solve_lp(invalid, backend, options);
+    expect(invalid_result.status == vikalp::SolveStatus::InvalidModel,
+           "invalid variable bounds are rejected");
+
+    auto valid = bounded_linear(1.0, 0.0, 2.0);
+    const std::vector<vikalp::Scalar> non_finite_start = {
+        vikalp::Model::infinity()};
+    const auto bad_start = vikalp::solver::solve_lp(
+        valid, backend, options, non_finite_start);
+    expect(bad_start.status == vikalp::SolveStatus::InvalidModel,
+           "non-finite warm starts are rejected");
+
+    valid.quadratic_objective.pattern = {1, 1, {0, 1}, {0}};
+    valid.quadratic_objective.values = {1.0};
+    const auto wrong_solver = vikalp::solver::solve_lp(valid, backend, options);
+    expect(wrong_solver.status == vikalp::SolveStatus::UnsupportedModel,
+           "LP solver rejects a quadratic model");
+
+    options.iteration_limit = -1;
+    valid.quadratic_objective = {};
+    const auto bad_options = vikalp::solver::solve_lp(valid, backend, options);
+    expect(bad_options.status == vikalp::SolveStatus::InvalidModel,
+           "negative iteration limits are rejected");
+}
+
+} // namespace
 
 int main() {
-    std::cout << "=== Running Flow C Continuous Solver Tests ===\n\n";
-    vikalp::MockExecutionBackend backend;
-
-    // --- TEST 1: Constrained LP Test ---
-    {
-        vikalp::Model lp_model;
-        lp_model.name = "ConstrainedLP";
-        lp_model.linear_objective = {1.0};
-        lp_model.variable_lower = {0.0};
-        lp_model.variable_upper = {20.0};
-
-        lp_model.constraint_matrix.pattern.rows = 1;
-        lp_model.constraint_matrix.pattern.columns = 1;
-        lp_model.constraint_matrix.pattern.row_offsets = {0, 1};
-        lp_model.constraint_matrix.pattern.column_indices = {0};
-        lp_model.constraint_matrix.values = {2.0};
-
-        lp_model.constraint_lower = {-vikalp::Model::infinity()}; // Added vikalp:: prefix
-        lp_model.constraint_upper = {16.0};
-
-        std::cout << "[LP Test] Running PDHG solver on constrained model...\n";
-        vikalp::SolveResult res = vikalp::solver::lp::solve_pdhg_baseline(lp_model, backend, 200);
-        
-        std::cout << "[LP Test] Iterations: " << res.iterations << "\n";
-        if (!res.primal_solution.empty()) {
-            std::cout << "[LP Test] Result x[0] = " << res.primal_solution[0] << "\n";
-        }
+    auto backend = vikalp::make_cpu_backend();
+    test_lp(*backend);
+    test_qp(*backend);
+    test_nlp(*backend);
+    test_failure_paths(*backend);
+    if (failures != 0) {
+        std::cerr << failures << " Flow C checks failed\n";
+        return 1;
     }
-
-    std::cout << "\n----------------------------------------\n\n";
-
-    // --- TEST 2: Convex QP Test ---
-    {
-        vikalp::Model qp_model;
-        qp_model.name = "ConvexQP";
-        qp_model.linear_objective = {-10.0};
-        qp_model.variable_lower = {0.0};
-        qp_model.variable_upper = {10.0};
-
-        qp_model.quadratic_objective.pattern.rows = 1;
-        qp_model.quadratic_objective.pattern.columns = 1;
-        qp_model.quadratic_objective.pattern.row_offsets = {0, 1};
-        qp_model.quadratic_objective.pattern.column_indices = {0};
-        qp_model.quadratic_objective.values = {2.0};
-
-        qp_model.constraint_matrix.pattern.rows = 0;
-        qp_model.constraint_matrix.pattern.columns = 1;
-        qp_model.constraint_matrix.pattern.row_offsets = {0};
-
-        std::cout << "[QP Test] Running PDQP solver on quadratic model...\n";
-        vikalp::SolveResult res = vikalp::solver::qp::solve_pdqp_baseline(qp_model, backend, 200);
-
-        std::cout << "[QP Test] Iterations: " << res.iterations << "\n";
-        if (!res.primal_solution.empty()) {
-            std::cout << "[QP Test] Result x[0] = " << res.primal_solution[0] << " (Expected optimal: 5.0)\n";
-        }
-    }
-
-    std::cout << "\n=== All Flow C Solver Tests Completed Successfully ===\n";
-    // --- TEST 3: NLP IPM Smoke Test ---
-    {
-        vikalp::Model nlp_model;
-        nlp_model.name = "SmoothNLP";
-        nlp_model.linear_objective = {0.0};
-        nlp_model.variable_lower = {-10.0};
-        nlp_model.variable_upper = {10.0};
-        // Attach a dummy nonlinear oracle indicator
-        // nlp_model.nonlinear is shared_ptr<const NonlinearOracle>
-
-        std::cout << "[NLP Test] Running IPM solver on nonlinear model skeleton...\n";
-        vikalp::SolveResult res = vikalp::solver::nlp::solve_nlp_ipm_baseline(nlp_model, backend, 10);
-        std::cout << "[NLP Test] Status code received: " << static_cast<int>(res.status) << "\n";
-    }
-    std::cout << "\n----------------------------------------\n\n";
-
-    // --- TEST 4: Continuous Failures / Infeasible Model Test ---
-    // Minimize 1.0 * x0, subject to conflicting bounds: x0 >= 15.0 and x0 <= 5.0 (Impossible!)
-    {
-        vikalp::Model infeasible_model;
-        infeasible_model.name = "InfeasibleLP";
-        infeasible_model.linear_objective = {1.0};
-        infeasible_model.variable_lower = {15.0}; // Conflict here
-        infeasible_model.variable_upper = {5.0};  // Conflict here
-
-        infeasible_model.constraint_matrix.pattern.rows = 0;
-        infeasible_model.constraint_matrix.pattern.columns = 1;
-        infeasible_model.constraint_matrix.pattern.row_offsets = {0};
-
-        std::cout << "[Failure Test] Running PDHG solver on infeasible model...\n";
-        vikalp::SolveResult res = vikalp::solver::lp::solve_pdhg_baseline(infeasible_model, backend, 100);
-        
-        std::cout << "[Failure Test] Status code received: " << static_cast<int>(res.status) 
-                  << " (Handled safely without crashing)\n";
-    }
+    std::cout << "ALL FLOW C CHECKS PASSED\n";
     return 0;
 }
